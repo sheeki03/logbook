@@ -1,0 +1,24 @@
+[package]
+name = "logbook-store"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "logbook storage: rusqlite (bundled) + refinery migrations + FTS5 + JSONL fallback."
+
+[dependencies]
+logbook-core = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+# rusqlite is pinned to 0.38 so libsqlite3-sys (0.36) is shared with refinery 0.9.1,
+# which requires rusqlite ">=0.23, <=0.38". `bundled` compiles SQLite in-tree.
+rusqlite = { version = "0.38", features = ["bundled"] }
+refinery = { version = "0.9", features = ["rusqlite"] }
+
+[dev-dependencies]
+tempfile = "3.27.0"
