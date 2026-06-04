@@ -1,0 +1,22 @@
+[package]
+name = "logbook-debug"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Non-invasive debug mode: passive evidence + DAP logpoints (alpha)."
+
+[dependencies]
+logbook-core.workspace = true
+logbook-store.workspace = true
+rusqlite = "0.38"
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "sync", "macros", "time", "io-util", "net", "process", "io-std"] }
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile = "3.27.0"
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time", "net", "io-util"] }
