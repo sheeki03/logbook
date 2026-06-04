@@ -1,0 +1,33 @@
+[package]
+name = "logbook-mcp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "rmcp stdio MCP surface; read-only by default, write tools gated."
+
+[dependencies]
+logbook-core.workspace = true
+logbook-store.workspace = true
+anyhow.workspace = true
+rmcp = { version = "1.7.0", features = ["server", "transport-io"] }
+rusqlite = { version = "0.38", features = ["bundled"] }
+# schemars 1.x — the version rmcp 1.7 re-exports; used for tool parameter schemas.
+schemars = "1.2.1"
+serde.workspace = true
+serde_json.workspace = true
+# `io-std` (additive to the workspace tokio features) supplies the stdin/stdout
+# handles rmcp's `stdio()` transport needs.
+tokio = { workspace = true, features = ["io-std"] }
+tracing.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
+tempfile = "3.27.0"
+# The integration test in `tests/write_tools_gated.rs` drives the real rmcp
+# `tools/call` path (not just `tools/list`) over an in-process duplex pipe, so
+# it needs the rmcp *client* surface in addition to the server one already in
+# `[dependencies]`.
+rmcp = { version = "1.7.0", features = ["client"] }
+tokio = { workspace = true, features = ["io-util", "macros", "rt-multi-thread"] }
