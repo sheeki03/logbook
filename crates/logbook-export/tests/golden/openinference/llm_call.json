@@ -1,0 +1,23 @@
+{
+  "attributes": {
+    "input.mime_type": "application/json",
+    "input.value": "[{\"content\":\"Summarize the build log.\",\"role\":\"user\"}]",
+    "llm.invocation_parameters": "{\"temperature\":0.2}",
+    "llm.model_name": "claude-3-5-sonnet",
+    "llm.provider": "anthropic",
+    "llm.token_count.completion": 345,
+    "llm.token_count.prompt": 1200,
+    "llm.token_count.total": 1545,
+    "logbook.category": "agent",
+    "openinference.span.kind": "LLM",
+    "output.mime_type": "application/json",
+    "output.value": "{\"content\":\"The build failed at step 3.\",\"role\":\"assistant\"}"
+  },
+  "end_time_unix_nano": "1704164646912500000",
+  "name": "anthropic chat",
+  "span_id": "1111111111111111",
+  "span_kind": "SPAN_KIND_INTERNAL",
+  "start_time_unix_nano": "1704164645678000000",
+  "status_code": "OK",
+  "trace_id": "0af7651916cd43dd8448eb211c80319c"
+}

@@ -1,0 +1,435 @@
+{
+  "resourceSpans": [
+    {
+      "resource": {
+        "attributes": [
+          {
+            "key": "service.name",
+            "value": {
+              "stringValue": "logbook"
+            }
+          }
+        ]
+      },
+      "scopeSpans": [
+        {
+          "scope": {
+            "name": "logbook"
+          },
+          "spans": [
+            {
+              "attributes": [
+                {
+                  "key": "gen_ai.request.model",
+                  "value": {
+                    "stringValue": "claude-3-5-sonnet"
+                  }
+                },
+                {
+                  "key": "gen_ai.request.temperature",
+                  "value": {
+                    "doubleValue": 0.2
+                  }
+                },
+                {
+                  "key": "gen_ai.response.model",
+                  "value": {
+                    "stringValue": "claude-3-5-sonnet"
+                  }
+                },
+                {
+                  "key": "gen_ai.system",
+                  "value": {
+                    "stringValue": "anthropic"
+                  }
+                },
+                {
+                  "key": "gen_ai.usage.input_tokens",
+                  "value": {
+                    "intValue": "1200"
+                  }
+                },
+                {
+                  "key": "gen_ai.usage.output_tokens",
+                  "value": {
+                    "intValue": "345"
+                  }
+                },
+                {
+                  "key": "gen_ai.usage.total_tokens",
+                  "value": {
+                    "intValue": "1545"
+                  }
+                },
+                {
+                  "key": "logbook.category",
+                  "value": {
+                    "stringValue": "agent"
+                  }
+                },
+                {
+                  "key": "logbook.input",
+                  "value": {
+                    "stringValue": "[{\"content\":\"Summarize the build log.\",\"role\":\"user\"}]"
+                  }
+                },
+                {
+                  "key": "logbook.kind",
+                  "value": {
+                    "stringValue": "llm"
+                  }
+                },
+                {
+                  "key": "logbook.llm.cost_usd",
+                  "value": {
+                    "doubleValue": 0.0123
+                  }
+                },
+                {
+                  "key": "logbook.operation",
+                  "value": {
+                    "stringValue": "chat.completion"
+                  }
+                },
+                {
+                  "key": "logbook.output",
+                  "value": {
+                    "stringValue": "{\"content\":\"The build failed at step 3.\",\"role\":\"assistant\"}"
+                  }
+                },
+                {
+                  "key": "logbook.type",
+                  "value": {
+                    "stringValue": "chat.completion"
+                  }
+                }
+              ],
+              "endTimeUnixNano": "1704164646912500000",
+              "kind": "SPAN_KIND_INTERNAL",
+              "name": "anthropic chat",
+              "spanId": "1111111111111111",
+              "startTimeUnixNano": "1704164645678000000",
+              "status": {
+                "code": "STATUS_CODE_OK"
+              },
+              "traceId": "0af7651916cd43dd8448eb211c80319c"
+            },
+            {
+              "attributes": [
+                {
+                  "key": "gen_ai.tool.arguments",
+                  "value": {
+                    "stringValue": "{\"path\":\"src/main.rs\"}"
+                  }
+                },
+                {
+                  "key": "gen_ai.tool.name",
+                  "value": {
+                    "stringValue": "read_file"
+                  }
+                },
+                {
+                  "key": "logbook.category",
+                  "value": {
+                    "stringValue": "agent"
+                  }
+                },
+                {
+                  "key": "logbook.kind",
+                  "value": {
+                    "stringValue": "tool"
+                  }
+                },
+                {
+                  "key": "logbook.operation",
+                  "value": {
+                    "stringValue": "call"
+                  }
+                },
+                {
+                  "key": "logbook.output",
+                  "value": {
+                    "stringValue": "fn main() { println!(\"hi\"); }"
+                  }
+                },
+                {
+                  "key": "logbook.tool.is_write",
+                  "value": {
+                    "boolValue": false
+                  }
+                },
+                {
+                  "key": "logbook.type",
+                  "value": {
+                    "stringValue": "tool.call"
+                  }
+                }
+              ],
+              "endTimeUnixNano": "1704164646690000000",
+              "kind": "SPAN_KIND_INTERNAL",
+              "name": "read_file",
+              "parentSpanId": "b7ad6b7169203331",
+              "spanId": "2222222222222222",
+              "startTimeUnixNano": "1704164646678000000",
+              "status": {
+                "code": "STATUS_CODE_OK"
+              },
+              "traceId": "0af7651916cd43dd8448eb211c80319c"
+            },
+            {
+              "attributes": [
+                {
+                  "key": "log.level",
+                  "value": {
+                    "stringValue": "error"
+                  }
+                },
+                {
+                  "key": "log.message",
+                  "value": {
+                    "stringValue": "error[E0308]: mismatched types"
+                  }
+                },
+                {
+                  "key": "logbook.category",
+                  "value": {
+                    "stringValue": "app_log"
+                  }
+                },
+                {
+                  "key": "logbook.kind",
+                  "value": {
+                    "stringValue": "log"
+                  }
+                },
+                {
+                  "key": "logbook.operation",
+                  "value": {
+                    "stringValue": "log"
+                  }
+                },
+                {
+                  "key": "logbook.type",
+                  "value": {
+                    "stringValue": "stderr"
+                  }
+                }
+              ],
+              "endTimeUnixNano": "1704164647678000000",
+              "kind": "SPAN_KIND_INTERNAL",
+              "name": "build error line",
+              "spanId": "3333333333333333",
+              "startTimeUnixNano": "1704164647678000000",
+              "status": {
+                "code": "STATUS_CODE_ERROR",
+                "message": "error[E0308]: mismatched types"
+              },
+              "traceId": "0af7651916cd43dd8448eb211c80319c"
+            },
+            {
+              "attributes": [
+                {
+                  "key": "http.request.body.size",
+                  "value": {
+                    "intValue": "0"
+                  }
+                },
+                {
+                  "key": "http.request.method",
+                  "value": {
+                    "stringValue": "GET"
+                  }
+                },
+                {
+                  "key": "http.response.body.size",
+                  "value": {
+                    "intValue": "2048"
+                  }
+                },
+                {
+                  "key": "http.response.status_code",
+                  "value": {
+                    "intValue": "200"
+                  }
+                },
+                {
+                  "key": "logbook.category",
+                  "value": {
+                    "stringValue": "browser"
+                  }
+                },
+                {
+                  "key": "logbook.kind",
+                  "value": {
+                    "stringValue": "browser"
+                  }
+                },
+                {
+                  "key": "logbook.operation",
+                  "value": {
+                    "stringValue": "request"
+                  }
+                },
+                {
+                  "key": "logbook.type",
+                  "value": {
+                    "stringValue": "fetch"
+                  }
+                },
+                {
+                  "key": "url.full",
+                  "value": {
+                    "stringValue": "https://app.example.test/api/users"
+                  }
+                }
+              ],
+              "endTimeUnixNano": "1704164648726000000",
+              "kind": "SPAN_KIND_CLIENT",
+              "name": "GET /api/users",
+              "spanId": "4444444444444444",
+              "startTimeUnixNano": "1704164648678000000",
+              "status": {
+                "code": "STATUS_CODE_OK"
+              },
+              "traceId": "0af7651916cd43dd8448eb211c80319c"
+            },
+            {
+              "attributes": [
+                {
+                  "key": "code.filepath",
+                  "value": {
+                    "stringValue": "src/config.rs"
+                  }
+                },
+                {
+                  "key": "code.lineno",
+                  "value": {
+                    "intValue": "42"
+                  }
+                },
+                {
+                  "key": "logbook.category",
+                  "value": {
+                    "stringValue": "security"
+                  }
+                },
+                {
+                  "key": "logbook.finding.message",
+                  "value": {
+                    "stringValue": "Possible hardcoded secret"
+                  }
+                },
+                {
+                  "key": "logbook.finding.rule_id",
+                  "value": {
+                    "stringValue": "rust.lang.security.hardcoded-secret"
+                  }
+                },
+                {
+                  "key": "logbook.finding.severity",
+                  "value": {
+                    "stringValue": "high"
+                  }
+                },
+                {
+                  "key": "logbook.finding.source",
+                  "value": {
+                    "stringValue": "semgrep"
+                  }
+                },
+                {
+                  "key": "logbook.kind",
+                  "value": {
+                    "stringValue": "finding"
+                  }
+                },
+                {
+                  "key": "logbook.operation",
+                  "value": {
+                    "stringValue": "finding"
+                  }
+                },
+                {
+                  "key": "logbook.type",
+                  "value": {
+                    "stringValue": "semgrep.finding"
+                  }
+                }
+              ],
+              "endTimeUnixNano": "1704164649678000000",
+              "kind": "SPAN_KIND_INTERNAL",
+              "name": "hardcoded-secret",
+              "spanId": "5555555555555555",
+              "startTimeUnixNano": "1704164649678000000",
+              "status": {
+                "code": "STATUS_CODE_ERROR"
+              },
+              "traceId": "0af7651916cd43dd8448eb211c80319c"
+            },
+            {
+              "attributes": [
+                {
+                  "key": "gen_ai.operation.role",
+                  "value": {
+                    "stringValue": "assistant"
+                  }
+                },
+                {
+                  "key": "logbook.agent.name",
+                  "value": {
+                    "stringValue": "claude"
+                  }
+                },
+                {
+                  "key": "logbook.agent.step",
+                  "value": {
+                    "intValue": "1"
+                  }
+                },
+                {
+                  "key": "logbook.category",
+                  "value": {
+                    "stringValue": "agent"
+                  }
+                },
+                {
+                  "key": "logbook.kind",
+                  "value": {
+                    "stringValue": "agent"
+                  }
+                },
+                {
+                  "key": "logbook.operation",
+                  "value": {
+                    "stringValue": "turn"
+                  }
+                },
+                {
+                  "key": "logbook.session.cwd",
+                  "value": {
+                    "stringValue": "/work/repo"
+                  }
+                },
+                {
+                  "key": "logbook.type",
+                  "value": {
+                    "stringValue": "agent.turn"
+                  }
+                }
+              ],
+              "endTimeUnixNano": "1704164653178000000",
+              "kind": "SPAN_KIND_INTERNAL",
+              "name": "assistant turn 1",
+              "spanId": "6666666666666666",
+              "startTimeUnixNano": "1704164650678000000",
+              "status": {
+                "code": "STATUS_CODE_OK"
+              },
+              "traceId": "0af7651916cd43dd8448eb211c80319c"
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

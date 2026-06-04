@@ -1,0 +1,20 @@
+{
+  "endTime": "2024-01-02T03:04:06.690Z",
+  "id": "2222222222222222",
+  "level": "DEFAULT",
+  "metadata": {
+    "gen_ai.tool.arguments": "{\"path\":\"src/main.rs\"}",
+    "gen_ai.tool.name": "read_file",
+    "logbook.category": "agent",
+    "logbook.kind": "tool",
+    "logbook.operation": "call",
+    "logbook.tool.is_write": false,
+    "logbook.type": "tool.call"
+  },
+  "name": "read_file",
+  "output": "fn main() { println!(\"hi\"); }",
+  "parentObservationId": "b7ad6b7169203331",
+  "startTime": "2024-01-02T03:04:06.678Z",
+  "traceId": "0af7651916cd43dd8448eb211c80319c",
+  "type": "SPAN"
+}

@@ -1,0 +1,26 @@
+{
+  "attributes": {
+    "code.filepath": "src/config.rs",
+    "code.lineno": 42,
+    "logbook.category": "security",
+    "logbook.finding.message": "Possible hardcoded secret",
+    "logbook.finding.rule_id": "rust.lang.security.hardcoded-secret",
+    "logbook.finding.severity": "high",
+    "logbook.finding.source": "semgrep",
+    "logbook.kind": "finding",
+    "logbook.operation": "finding",
+    "logbook.type": "semgrep.finding",
+    "mlflow.spanType": "SECURITY"
+  },
+  "context": {
+    "span_id": "5555555555555555",
+    "trace_id": "0af7651916cd43dd8448eb211c80319c"
+  },
+  "end_time_ns": 1704164649678000000,
+  "name": "hardcoded-secret",
+  "parent_id": null,
+  "span_type": "SECURITY",
+  "start_time_ns": 1704164649678000000,
+  "status_code": "ERROR",
+  "status_message": ""
+}

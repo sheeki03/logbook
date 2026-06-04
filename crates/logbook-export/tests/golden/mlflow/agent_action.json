@@ -1,0 +1,24 @@
+{
+  "attributes": {
+    "gen_ai.operation.role": "assistant",
+    "logbook.agent.name": "claude",
+    "logbook.agent.step": 1,
+    "logbook.category": "agent",
+    "logbook.kind": "agent",
+    "logbook.operation": "turn",
+    "logbook.session.cwd": "/work/repo",
+    "logbook.type": "agent.turn",
+    "mlflow.spanType": "AGENT"
+  },
+  "context": {
+    "span_id": "6666666666666666",
+    "trace_id": "0af7651916cd43dd8448eb211c80319c"
+  },
+  "end_time_ns": 1704164653178000000,
+  "name": "assistant turn 1",
+  "parent_id": null,
+  "span_type": "AGENT",
+  "start_time_ns": 1704164650678000000,
+  "status_code": "OK",
+  "status_message": ""
+}

@@ -1,0 +1,22 @@
+{
+  "attributes": {
+    "log.level": "error",
+    "log.message": "error[E0308]: mismatched types",
+    "logbook.category": "app_log",
+    "logbook.kind": "log",
+    "logbook.operation": "log",
+    "logbook.type": "stderr",
+    "mlflow.spanType": "UNKNOWN"
+  },
+  "context": {
+    "span_id": "3333333333333333",
+    "trace_id": "0af7651916cd43dd8448eb211c80319c"
+  },
+  "end_time_ns": 1704164647678000000,
+  "name": "build error line",
+  "parent_id": null,
+  "span_type": "UNKNOWN",
+  "start_time_ns": 1704164647678000000,
+  "status_code": "ERROR",
+  "status_message": "error[E0308]: mismatched types"
+}

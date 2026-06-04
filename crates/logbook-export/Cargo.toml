@@ -1,0 +1,15 @@
+[package]
+name = "logbook-export"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Span export: OTel/OpenInference/Langfuse/MLflow (schema + golden tests in v1). Stub."
+
+[dependencies]
+logbook-core = { workspace = true }
+opentelemetry = "0.32.0"
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+thiserror.workspace = true

@@ -1,0 +1,73 @@
+{
+  "attributes": [
+    {
+      "key": "code.filepath",
+      "value": {
+        "stringValue": "src/config.rs"
+      }
+    },
+    {
+      "key": "code.lineno",
+      "value": {
+        "intValue": "42"
+      }
+    },
+    {
+      "key": "logbook.category",
+      "value": {
+        "stringValue": "security"
+      }
+    },
+    {
+      "key": "logbook.finding.message",
+      "value": {
+        "stringValue": "Possible hardcoded secret"
+      }
+    },
+    {
+      "key": "logbook.finding.rule_id",
+      "value": {
+        "stringValue": "rust.lang.security.hardcoded-secret"
+      }
+    },
+    {
+      "key": "logbook.finding.severity",
+      "value": {
+        "stringValue": "high"
+      }
+    },
+    {
+      "key": "logbook.finding.source",
+      "value": {
+        "stringValue": "semgrep"
+      }
+    },
+    {
+      "key": "logbook.kind",
+      "value": {
+        "stringValue": "finding"
+      }
+    },
+    {
+      "key": "logbook.operation",
+      "value": {
+        "stringValue": "finding"
+      }
+    },
+    {
+      "key": "logbook.type",
+      "value": {
+        "stringValue": "semgrep.finding"
+      }
+    }
+  ],
+  "endTimeUnixNano": "1704164649678000000",
+  "kind": "SPAN_KIND_INTERNAL",
+  "name": "hardcoded-secret",
+  "spanId": "5555555555555555",
+  "startTimeUnixNano": "1704164649678000000",
+  "status": {
+    "code": "STATUS_CODE_ERROR"
+  },
+  "traceId": "0af7651916cd43dd8448eb211c80319c"
+}

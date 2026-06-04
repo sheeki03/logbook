@@ -1,0 +1,18 @@
+{
+  "endTime": "2024-01-02T03:04:07.678Z",
+  "id": "3333333333333333",
+  "level": "ERROR",
+  "metadata": {
+    "log.level": "error",
+    "log.message": "error[E0308]: mismatched types",
+    "logbook.category": "app_log",
+    "logbook.kind": "log",
+    "logbook.operation": "log",
+    "logbook.type": "stderr"
+  },
+  "name": "build error line",
+  "startTime": "2024-01-02T03:04:07.678Z",
+  "statusMessage": "error[E0308]: mismatched types",
+  "traceId": "0af7651916cd43dd8448eb211c80319c",
+  "type": "EVENT"
+}

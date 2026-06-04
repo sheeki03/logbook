@@ -1,0 +1,97 @@
+{
+  "attributes": [
+    {
+      "key": "gen_ai.request.model",
+      "value": {
+        "stringValue": "claude-3-5-sonnet"
+      }
+    },
+    {
+      "key": "gen_ai.request.temperature",
+      "value": {
+        "doubleValue": 0.2
+      }
+    },
+    {
+      "key": "gen_ai.response.model",
+      "value": {
+        "stringValue": "claude-3-5-sonnet"
+      }
+    },
+    {
+      "key": "gen_ai.system",
+      "value": {
+        "stringValue": "anthropic"
+      }
+    },
+    {
+      "key": "gen_ai.usage.input_tokens",
+      "value": {
+        "intValue": "1200"
+      }
+    },
+    {
+      "key": "gen_ai.usage.output_tokens",
+      "value": {
+        "intValue": "345"
+      }
+    },
+    {
+      "key": "gen_ai.usage.total_tokens",
+      "value": {
+        "intValue": "1545"
+      }
+    },
+    {
+      "key": "logbook.category",
+      "value": {
+        "stringValue": "agent"
+      }
+    },
+    {
+      "key": "logbook.input",
+      "value": {
+        "stringValue": "[{\"content\":\"Summarize the build log.\",\"role\":\"user\"}]"
+      }
+    },
+    {
+      "key": "logbook.kind",
+      "value": {
+        "stringValue": "llm"
+      }
+    },
+    {
+      "key": "logbook.llm.cost_usd",
+      "value": {
+        "doubleValue": 0.0123
+      }
+    },
+    {
+      "key": "logbook.operation",
+      "value": {
+        "stringValue": "chat.completion"
+      }
+    },
+    {
+      "key": "logbook.output",
+      "value": {
+        "stringValue": "{\"content\":\"The build failed at step 3.\",\"role\":\"assistant\"}"
+      }
+    },
+    {
+      "key": "logbook.type",
+      "value": {
+        "stringValue": "chat.completion"
+      }
+    }
+  ],
+  "endTimeUnixNano": "1704164646912500000",
+  "kind": "SPAN_KIND_INTERNAL",
+  "name": "anthropic chat",
+  "spanId": "1111111111111111",
+  "startTimeUnixNano": "1704164645678000000",
+  "status": {
+    "code": "STATUS_CODE_OK"
+  },
+  "traceId": "0af7651916cd43dd8448eb211c80319c"
+}

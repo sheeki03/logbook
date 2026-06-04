@@ -1,0 +1,37 @@
+{
+  "endTime": "2024-01-02T03:04:06.912Z",
+  "id": "1111111111111111",
+  "input": [
+    {
+      "content": "Summarize the build log.",
+      "role": "user"
+    }
+  ],
+  "level": "DEFAULT",
+  "metadata": {
+    "gen_ai.system": "anthropic",
+    "logbook.category": "agent",
+    "logbook.kind": "llm",
+    "logbook.llm.cost_usd": 0.0123,
+    "logbook.operation": "chat.completion",
+    "logbook.type": "chat.completion"
+  },
+  "model": "claude-3-5-sonnet",
+  "modelParameters": {
+    "temperature": 0.2
+  },
+  "name": "anthropic chat",
+  "output": {
+    "content": "The build failed at step 3.",
+    "role": "assistant"
+  },
+  "startTime": "2024-01-02T03:04:05.678Z",
+  "traceId": "0af7651916cd43dd8448eb211c80319c",
+  "type": "GENERATION",
+  "usage": {
+    "input": 1200,
+    "output": 345,
+    "total": 1545,
+    "unit": "TOKENS"
+  }
+}

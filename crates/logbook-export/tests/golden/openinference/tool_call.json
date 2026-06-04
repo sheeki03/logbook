@@ -1,0 +1,18 @@
+{
+  "attributes": {
+    "logbook.category": "agent",
+    "openinference.span.kind": "TOOL",
+    "output.mime_type": "text/plain",
+    "output.value": "fn main() { println!(\"hi\"); }",
+    "tool.name": "read_file",
+    "tool.parameters": "{\"path\":\"src/main.rs\"}"
+  },
+  "end_time_unix_nano": "1704164646690000000",
+  "name": "read_file",
+  "parent_id": "b7ad6b7169203331",
+  "span_id": "2222222222222222",
+  "span_kind": "SPAN_KIND_INTERNAL",
+  "start_time_unix_nano": "1704164646678000000",
+  "status_code": "OK",
+  "trace_id": "0af7651916cd43dd8448eb211c80319c"
+}

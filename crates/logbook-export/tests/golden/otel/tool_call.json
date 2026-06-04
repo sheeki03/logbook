@@ -1,0 +1,62 @@
+{
+  "attributes": [
+    {
+      "key": "gen_ai.tool.arguments",
+      "value": {
+        "stringValue": "{\"path\":\"src/main.rs\"}"
+      }
+    },
+    {
+      "key": "gen_ai.tool.name",
+      "value": {
+        "stringValue": "read_file"
+      }
+    },
+    {
+      "key": "logbook.category",
+      "value": {
+        "stringValue": "agent"
+      }
+    },
+    {
+      "key": "logbook.kind",
+      "value": {
+        "stringValue": "tool"
+      }
+    },
+    {
+      "key": "logbook.operation",
+      "value": {
+        "stringValue": "call"
+      }
+    },
+    {
+      "key": "logbook.output",
+      "value": {
+        "stringValue": "fn main() { println!(\"hi\"); }"
+      }
+    },
+    {
+      "key": "logbook.tool.is_write",
+      "value": {
+        "boolValue": false
+      }
+    },
+    {
+      "key": "logbook.type",
+      "value": {
+        "stringValue": "tool.call"
+      }
+    }
+  ],
+  "endTimeUnixNano": "1704164646690000000",
+  "kind": "SPAN_KIND_INTERNAL",
+  "name": "read_file",
+  "parentSpanId": "b7ad6b7169203331",
+  "spanId": "2222222222222222",
+  "startTimeUnixNano": "1704164646678000000",
+  "status": {
+    "code": "STATUS_CODE_OK"
+  },
+  "traceId": "0af7651916cd43dd8448eb211c80319c"
+}

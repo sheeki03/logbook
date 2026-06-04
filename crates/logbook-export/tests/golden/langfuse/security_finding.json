@@ -1,0 +1,21 @@
+{
+  "endTime": "2024-01-02T03:04:09.678Z",
+  "id": "5555555555555555",
+  "level": "ERROR",
+  "metadata": {
+    "code.filepath": "src/config.rs",
+    "code.lineno": 42,
+    "logbook.category": "security",
+    "logbook.finding.message": "Possible hardcoded secret",
+    "logbook.finding.rule_id": "rust.lang.security.hardcoded-secret",
+    "logbook.finding.severity": "high",
+    "logbook.finding.source": "semgrep",
+    "logbook.kind": "finding",
+    "logbook.operation": "finding",
+    "logbook.type": "semgrep.finding"
+  },
+  "name": "hardcoded-secret",
+  "startTime": "2024-01-02T03:04:09.678Z",
+  "traceId": "0af7651916cd43dd8448eb211c80319c",
+  "type": "EVENT"
+}

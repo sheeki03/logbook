@@ -1,0 +1,67 @@
+{
+  "attributes": [
+    {
+      "key": "http.request.body.size",
+      "value": {
+        "intValue": "0"
+      }
+    },
+    {
+      "key": "http.request.method",
+      "value": {
+        "stringValue": "GET"
+      }
+    },
+    {
+      "key": "http.response.body.size",
+      "value": {
+        "intValue": "2048"
+      }
+    },
+    {
+      "key": "http.response.status_code",
+      "value": {
+        "intValue": "200"
+      }
+    },
+    {
+      "key": "logbook.category",
+      "value": {
+        "stringValue": "browser"
+      }
+    },
+    {
+      "key": "logbook.kind",
+      "value": {
+        "stringValue": "browser"
+      }
+    },
+    {
+      "key": "logbook.operation",
+      "value": {
+        "stringValue": "request"
+      }
+    },
+    {
+      "key": "logbook.type",
+      "value": {
+        "stringValue": "fetch"
+      }
+    },
+    {
+      "key": "url.full",
+      "value": {
+        "stringValue": "https://app.example.test/api/users"
+      }
+    }
+  ],
+  "endTimeUnixNano": "1704164648726000000",
+  "kind": "SPAN_KIND_CLIENT",
+  "name": "GET /api/users",
+  "spanId": "4444444444444444",
+  "startTimeUnixNano": "1704164648678000000",
+  "status": {
+    "code": "STATUS_CODE_OK"
+  },
+  "traceId": "0af7651916cd43dd8448eb211c80319c"
+}

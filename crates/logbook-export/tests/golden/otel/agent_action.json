@@ -1,0 +1,61 @@
+{
+  "attributes": [
+    {
+      "key": "gen_ai.operation.role",
+      "value": {
+        "stringValue": "assistant"
+      }
+    },
+    {
+      "key": "logbook.agent.name",
+      "value": {
+        "stringValue": "claude"
+      }
+    },
+    {
+      "key": "logbook.agent.step",
+      "value": {
+        "intValue": "1"
+      }
+    },
+    {
+      "key": "logbook.category",
+      "value": {
+        "stringValue": "agent"
+      }
+    },
+    {
+      "key": "logbook.kind",
+      "value": {
+        "stringValue": "agent"
+      }
+    },
+    {
+      "key": "logbook.operation",
+      "value": {
+        "stringValue": "turn"
+      }
+    },
+    {
+      "key": "logbook.session.cwd",
+      "value": {
+        "stringValue": "/work/repo"
+      }
+    },
+    {
+      "key": "logbook.type",
+      "value": {
+        "stringValue": "agent.turn"
+      }
+    }
+  ],
+  "endTimeUnixNano": "1704164653178000000",
+  "kind": "SPAN_KIND_INTERNAL",
+  "name": "assistant turn 1",
+  "spanId": "6666666666666666",
+  "startTimeUnixNano": "1704164650678000000",
+  "status": {
+    "code": "STATUS_CODE_OK"
+  },
+  "traceId": "0af7651916cd43dd8448eb211c80319c"
+}

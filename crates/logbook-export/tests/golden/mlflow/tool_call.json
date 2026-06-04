@@ -1,0 +1,24 @@
+{
+  "attributes": {
+    "gen_ai.tool.arguments": "{\"path\":\"src/main.rs\"}",
+    "gen_ai.tool.name": "read_file",
+    "logbook.category": "agent",
+    "logbook.kind": "tool",
+    "logbook.operation": "call",
+    "logbook.tool.is_write": false,
+    "logbook.type": "tool.call",
+    "mlflow.spanOutputs": "fn main() { println!(\"hi\"); }",
+    "mlflow.spanType": "TOOL"
+  },
+  "context": {
+    "span_id": "2222222222222222",
+    "trace_id": "0af7651916cd43dd8448eb211c80319c"
+  },
+  "end_time_ns": 1704164646690000000,
+  "name": "read_file",
+  "parent_id": "b7ad6b7169203331",
+  "span_type": "TOOL",
+  "start_time_ns": 1704164646678000000,
+  "status_code": "OK",
+  "status_message": ""
+}

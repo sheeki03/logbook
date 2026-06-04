@@ -1,0 +1,13 @@
+{
+  "attributes": {
+    "logbook.category": "browser",
+    "openinference.span.kind": "CHAIN"
+  },
+  "end_time_unix_nano": "1704164648726000000",
+  "name": "GET /api/users",
+  "span_id": "4444444444444444",
+  "span_kind": "SPAN_KIND_CLIENT",
+  "start_time_unix_nano": "1704164648678000000",
+  "status_code": "OK",
+  "trace_id": "0af7651916cd43dd8448eb211c80319c"
+}

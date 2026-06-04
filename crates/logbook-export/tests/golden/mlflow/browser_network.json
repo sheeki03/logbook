@@ -1,0 +1,25 @@
+{
+  "attributes": {
+    "http.request.body.size": 0,
+    "http.request.method": "GET",
+    "http.response.body.size": 2048,
+    "http.response.status_code": 200,
+    "logbook.category": "browser",
+    "logbook.kind": "browser",
+    "logbook.operation": "request",
+    "logbook.type": "fetch",
+    "mlflow.spanType": "TOOL",
+    "url.full": "https://app.example.test/api/users"
+  },
+  "context": {
+    "span_id": "4444444444444444",
+    "trace_id": "0af7651916cd43dd8448eb211c80319c"
+  },
+  "end_time_ns": 1704164648726000000,
+  "name": "GET /api/users",
+  "parent_id": null,
+  "span_type": "TOOL",
+  "start_time_ns": 1704164648678000000,
+  "status_code": "OK",
+  "status_message": ""
+}

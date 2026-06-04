@@ -1,0 +1,38 @@
+{
+  "attributes": {
+    "gen_ai.request.model": "claude-3-5-sonnet",
+    "gen_ai.request.temperature": 0.2,
+    "gen_ai.response.model": "claude-3-5-sonnet",
+    "gen_ai.system": "anthropic",
+    "gen_ai.usage.input_tokens": 1200,
+    "gen_ai.usage.output_tokens": 345,
+    "gen_ai.usage.total_tokens": 1545,
+    "logbook.category": "agent",
+    "logbook.kind": "llm",
+    "logbook.llm.cost_usd": 0.0123,
+    "logbook.operation": "chat.completion",
+    "logbook.type": "chat.completion",
+    "mlflow.spanInputs": [
+      {
+        "content": "Summarize the build log.",
+        "role": "user"
+      }
+    ],
+    "mlflow.spanOutputs": {
+      "content": "The build failed at step 3.",
+      "role": "assistant"
+    },
+    "mlflow.spanType": "LLM"
+  },
+  "context": {
+    "span_id": "1111111111111111",
+    "trace_id": "0af7651916cd43dd8448eb211c80319c"
+  },
+  "end_time_ns": 1704164646912500000,
+  "name": "anthropic chat",
+  "parent_id": null,
+  "span_type": "LLM",
+  "start_time_ns": 1704164645678000000,
+  "status_code": "OK",
+  "status_message": ""
+}

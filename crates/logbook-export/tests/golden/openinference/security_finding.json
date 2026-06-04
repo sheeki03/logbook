@@ -1,0 +1,13 @@
+{
+  "attributes": {
+    "logbook.category": "security",
+    "openinference.span.kind": "CHAIN"
+  },
+  "end_time_unix_nano": "1704164649678000000",
+  "name": "hardcoded-secret",
+  "span_id": "5555555555555555",
+  "span_kind": "SPAN_KIND_INTERNAL",
+  "start_time_unix_nano": "1704164649678000000",
+  "status_code": "ERROR",
+  "trace_id": "0af7651916cd43dd8448eb211c80319c"
+}
