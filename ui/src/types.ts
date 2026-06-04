@@ -1,0 +1,167 @@
+// Wire types mirroring the Rust `logbook-core` Event model (plan §2) and the
+// inventory DTOs returned by `logbook-ui`'s JSON API. Kept intentionally close
+// to the serde representation: snake_case categories, flattened domain blocks,
+// `type` (not `type_`) on the wire.
+
+export type Category =
+  | "agent"
+  | "browser"
+  | "app_log"
+  | "code_test"
+  | "security"
+  | "inventory";
+
+export type Kind =
+  | "log"
+  | "llm"
+  | "tool"
+  | "agent"
+  | "browser"
+  | "network"
+  | "finding"
+  | "test"
+  | "span"
+  | "other";
+
+export type Status = "unset" | "ok" | "error";
+
+export type Severity = "info" | "low" | "medium" | "high" | "critical";
+
+export interface LlmBlock {
+  provider?: string;
+  model?: string;
+  input_tokens?: number;
+  output_tokens?: number;
+  total_tokens?: number;
+  temperature?: number;
+  cost_usd?: number;
+}
+
+export interface ToolBlock {
+  tool_name?: string;
+  is_write?: boolean;
+  arguments?: unknown;
+}
+
+export interface AgentBlock {
+  agent?: string;
+  step?: number;
+  role?: string;
+}
+
+export interface ConsoleBlock {
+  level?: string;
+  message?: string;
+  url?: string;
+  stack?: string;
+}
+
+export interface NetworkBlock {
+  method?: string;
+  url?: string;
+  status_code?: number;
+  request_bytes?: number;
+  response_bytes?: number;
+}
+
+export interface FindingBlock {
+  source?: string;
+  rule_id?: string;
+  severity?: Severity;
+  file?: string;
+  line?: number;
+  message?: string;
+}
+
+// The unified event. Domain blocks are flattened onto the parent object by
+// serde (`#[serde(flatten)]`), so they appear as optional sibling keys.
+export interface AgentEvent {
+  id: string;
+  trace_id: string;
+  parent_id?: string;
+  timestamp: number; // microseconds since UNIX epoch
+  duration_ms?: number;
+  kind: Kind;
+  type: string;
+  category: Category;
+  operation: string;
+  name: string;
+  status: Status;
+  error?: string;
+  attributes?: Record<string, unknown>;
+  input?: unknown;
+  output?: unknown;
+  session_id?: string;
+  llm?: LlmBlock;
+  tool?: ToolBlock;
+  agent?: AgentBlock;
+  console?: ConsoleBlock;
+  network?: NetworkBlock;
+  finding?: FindingBlock;
+}
+
+// ---- Inventory DTOs (plan §7b) ----
+
+export interface Endpoint {
+  id: string;
+  hostname: string;
+  os?: string;
+  arch?: string;
+  first_seen: number;
+  last_seen: number;
+}
+
+export interface AgentInstall {
+  id: string;
+  endpoint_id: string;
+  name: string;
+  version?: string;
+  path?: string;
+  sanctioned: boolean;
+  discovered_at: number;
+}
+
+export interface McpServer {
+  id: string;
+  endpoint_id: string;
+  name: string;
+  source_config?: string;
+  command?: string;
+  transport?: string;
+  sanctioned: boolean;
+  has_secret: boolean;
+  discovered_at: number;
+}
+
+export interface AgentSession {
+  id: string;
+  endpoint_id?: string;
+  agent: string;
+  command: string;
+  trace_id?: string;
+  started_at: number;
+  ended_at?: number;
+  exit_code?: number;
+}
+
+export interface InventoryFinding {
+  id: string;
+  endpoint_id?: string;
+  kind: string;
+  severity?: Severity;
+  subject?: string;
+  message?: string;
+  created_at: number;
+}
+
+export interface Inventory {
+  endpoints: Endpoint[];
+  agents: AgentInstall[];
+  mcp_servers: McpServer[];
+  sessions: AgentSession[];
+  findings: InventoryFinding[];
+}
+
+export interface EventPage {
+  events: AgentEvent[];
+}
