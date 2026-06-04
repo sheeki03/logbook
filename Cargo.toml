@@ -1,0 +1,36 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/logbook-core",
+    "crates/logbook-store",
+    "crates/logbook-capture",
+    "crates/logbook-collector",
+    "crates/logbook-mcp",
+    "crates/logbook-debug",
+    "crates/logbook-inventory",
+    "crates/logbook-security",
+    "crates/logbook-ui",
+    "crates/logbook-export",
+    "crates/logbook-hub",
+    "crates/logbook-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+repository = "https://github.com/logbook/logbook"
+rust-version = "1.80"
+
+[workspace.dependencies]
+# Internal crates
+logbook-core = { path = "crates/logbook-core" }
+logbook-store = { path = "crates/logbook-store" }
+
+# Shared third-party deps — versions resolved by `cargo add` against crates.io.
+tokio = { version = "1.52.3", features = ["rt-multi-thread", "rt", "sync", "macros", "time"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"
+anyhow = "1.0.102"
+thiserror = "2.0.18"
+tracing = "0.1.44"

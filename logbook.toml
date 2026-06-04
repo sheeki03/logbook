@@ -1,0 +1,30 @@
+# logbook.toml — permission model
+#
+# Shipped defaults are intentionally conservative:
+#   read-only, no external egress, redaction on, generated ingest token, no `watch`.
+# Writes require an explicit `enabled_writes` entry + the matching `allow_*` flag
+# + (for browser) a non-empty `allowed_domains` + interactive confirmation.
+
+[permissions]
+enabled_writes         = []      # subset of ["browser","dap","security","export","inventory_watch"]; [] = read-only
+allowed_domains        = []      # egress allowlist for browser nav/replay; [] blocks all external navigation
+allow_browser_sessions = false   # gate browser_start_session / navigate / replay / screenshot
+allow_dap              = false   # gate DAP logpoints (alpha)
+allow_security_scans   = false   # gate security_scan / scan_agent_diff
+
+[ingest]
+token_mode = "generated"         # "generated" (collector.token, 0600) | "env" (LOGBOOK_INGEST_TOKEN) | "off" (DEV/TEST ONLY — not a normal option)
+
+[redaction]
+enabled = true                   # default on
+deny    = []                     # extra secret patterns
+allow   = []                     # false-positive exclusions
+
+[retention]
+max_age_days = 14
+max_db_mb    = 512
+
+[scanners]                        # explicit paths; missing binary = soft-degrade, not error
+semgrep     = "semgrep"
+trivy       = "trivy"
+cargo_audit = "cargo-audit"
