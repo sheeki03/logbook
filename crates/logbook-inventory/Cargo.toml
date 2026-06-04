@@ -1,0 +1,22 @@
+[package]
+name = "logbook-inventory"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Endpoint Inventory Lite: agent/MCP discovery, agent wrapper, diff watcher, risk findings (local-only, read-only)."
+
+[dependencies]
+logbook-core = { workspace = true }
+logbook-store = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+toml = "1.1"
+clap = { version = "4.6", features = ["derive"] }
+rusqlite = "0.38"
+
+[dev-dependencies]
+tempfile = "3.27.0"
