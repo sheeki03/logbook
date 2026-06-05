@@ -26,8 +26,9 @@ use std::path::PathBuf;
 
 use clap::Args;
 
-use logbook_core::{Event, LogbookConfig, Severity};
+use logbook_core::{Category, Event, Kind, LogbookConfig, SessionId, Severity, TraceId};
 use logbook_detect::{builtin_rules, detect, DetectConfig};
+use logbook_inventory::store_ext::{self, AgentActionDiff};
 use logbook_store::{Query, Store};
 
 /// How many recent events to scan when no session id is given.
@@ -101,12 +102,85 @@ pub fn run(args: DetectArgs) -> anyhow::Result<i32> {
 
 /// Collect the events to feed the rules. With a session id, scope to that
 /// session (oldest-first); without one, take the newest `--limit` events.
+///
+/// `logbook agent` records its per-file diffs in the `agent_actions` table, not
+/// the `events` table, so a query of `events` alone never shows the rules a
+/// session's diffs — and `secret_in_diff` (which fires on a redaction marker in a
+/// diff) would silently miss every wrapped session. We therefore fold the
+/// session's `agent_actions` diffs in as synthetic `Kind::Agent` diff events (see
+/// [`synthetic_diff_events`]).
 fn gather_events(store: &Store, args: &DetectArgs) -> anyhow::Result<Vec<Event>> {
-    let query = match &args.session_id {
-        Some(id) => Query::new().session(id.clone()).oldest_first(),
-        None => Query::new().limit(args.limit),
-    };
-    Ok(store.query(&query)?)
+    match &args.session_id {
+        // Session scope: reuse the shared gather so `logbook detect <id>` and
+        // `logbook guard` fold diffs identically.
+        Some(id) => gather_session_events(store, id),
+        // No-session "recent" pass: newest `--limit` events, plus recent diffs
+        // across all sessions (capped the same) so a bare `logbook detect` isn't
+        // blind to diff secrets either.
+        None => {
+            let mut events = store.query(&Query::new().limit(args.limit))?;
+            let actions = store_ext::recent_agent_action_diffs(store, args.limit)?;
+            events.extend(synthetic_diff_events(&actions, None));
+            Ok(events)
+        }
+    }
+}
+
+/// Gather the events the rules evaluate for **one recorded session**: its stored
+/// `events` (oldest-first) plus its `agent_actions` diffs folded in as synthetic
+/// `Kind::Agent` diff events (see [`synthetic_diff_events`]). Shared by `logbook
+/// detect <session>` and `logbook guard` so both see a session's per-file diffs —
+/// without this, `secret_in_diff` never fires on a wrapped session.
+///
+/// # Errors
+/// Returns an error if the event query or the `agent_actions` read fails.
+pub(crate) fn gather_session_events(store: &Store, session_id: &str) -> anyhow::Result<Vec<Event>> {
+    let mut events = store.query(&Query::new().session(session_id.to_string()).oldest_first())?;
+    let actions = store_ext::agent_actions_for_session(store, session_id)?;
+    events.extend(synthetic_diff_events(&actions, Some(session_id)));
+    Ok(events)
+}
+
+/// Turn recorded `agent_actions` rows (path, redacted diff, owning trace) into
+/// synthetic `Kind::Agent` diff events the rules can scan.
+///
+/// Only actions that carry a **non-empty** `diff` produce an event (a NULL/empty
+/// diff has nothing for `secret_in_diff` to find). The diff text is carried in
+/// the `diff` attribute — exactly the carrier the rule's `secret_in_diff`
+/// fixtures use — so `view::haystack` concatenates it and `first_redaction_class`
+/// can spot a `«REDACTED:…»` marker; `Kind::Agent` already satisfies the rule's
+/// `looks_like_diff` gate (and the `diff` attribute independently would too). The
+/// file `path` is set as the event name and as the `path` attribute (the latter
+/// feeds the finding's file locator).
+///
+/// Each event is correlated on the action's session trace (parsed from the hex
+/// `trace_id` joined off `agent_sessions`); a missing/malformed trace falls back
+/// to a fresh id so the event is still well-formed. When a `session_id` scope is
+/// known it is stamped on every event so the finding lands on that session.
+fn synthetic_diff_events(actions: &[AgentActionDiff], session_id: Option<&str>) -> Vec<Event> {
+    let mut out = Vec::new();
+    for (path, diff, trace_hex) in actions {
+        let Some(diff) = diff.as_deref().filter(|d| !d.is_empty()) else {
+            continue;
+        };
+        let trace = trace_hex
+            .as_deref()
+            .and_then(|h| h.parse::<TraceId>().ok())
+            .unwrap_or_else(TraceId::new);
+
+        let name = path.as_deref().unwrap_or("agent.action");
+        let mut ev = Event::new(trace, Kind::Agent, Category::Agent, "agent.action")
+            .with_name(name)
+            .with_attr("diff", diff.to_string());
+        if let Some(p) = path.as_deref() {
+            ev = ev.with_attr("path", p.to_string());
+        }
+        if let Some(sid) = session_id {
+            ev = ev.with_session(SessionId::new(sid));
+        }
+        out.push(ev);
+    }
+    out
 }
 
 /// Build the [`DetectConfig`] for this run: the egress allowlist comes from
@@ -294,6 +368,87 @@ mod tests {
         assert!(
             findings.iter().all(|e| e.kind != Kind::Finding),
             "a Medium finding must be filtered out by --severity high"
+        );
+    }
+
+    /// Regression (dogfood): `logbook agent` stores its file diffs in
+    /// `agent_actions`, not `events`. A redaction marker inside such a diff must
+    /// be caught by `secret_in_diff` even though NO `events` row carries it — the
+    /// gather folds the session's `agent_actions` diffs in as synthetic diff
+    /// events. Before the fix, `gather_events` only saw `events` and produced
+    /// "no findings".
+    #[test]
+    fn secret_in_diff_fires_on_agent_actions_diff_with_no_events_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open_in_dir(dir.path()).unwrap();
+
+        // Seed a session header + one action whose redacted diff still shows a
+        // `«REDACTED:CLOUD_KEY:20»` marker inside a `diff --git`/`@@` body — the
+        // exact shape the wrapper persists for a scrubbed AWS key in creds.txt.
+        // Deliberately insert NO `events` row carrying the diff.
+        let trace = TraceId::new();
+        let trace_hex = trace.to_hex();
+        store
+            .write(move |conn| {
+                conn.execute(
+                    "INSERT INTO agent_sessions \
+                       (id, endpoint_id, agent, command, trace_id, started_at, ended_at, exit_code) \
+                     VALUES ('sess-diff', NULL, 'claude', 'claude -- edit creds', ?1, 100, 200, 0)",
+                    [&trace_hex],
+                )?;
+                conn.execute(
+                    "INSERT INTO agent_actions \
+                       (id, session_id, kind, path, detail, observed_at, \
+                        diff, diff_bytes, post_hash, revert_safe, max_sensitivity) \
+                     VALUES ('act-diff', 'sess-diff', 'file_modified', 'creds.txt', NULL, 160, \
+                             ?1, NULL, NULL, 0, 'file_diffs')",
+                    [
+                        "diff --git a/creds.txt b/creds.txt\n@@ -1 +1 @@\n\
+                         +aws_key = \u{ab}REDACTED:CLOUD_KEY:20\u{bb}\n",
+                    ],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+
+        // Sanity: the `events` table is genuinely empty for this session, so a
+        // pre-fix gather (events only) would have nothing to flag.
+        assert!(
+            store
+                .query(&Query::new().session("sess-diff".to_string()))
+                .unwrap()
+                .is_empty(),
+            "precondition: no events row carries the diff"
+        );
+
+        // Gather (folds the agent_actions diff in) + run the full rule set.
+        let events = gather_session_events(&store, "sess-diff").unwrap();
+        let rules = builtin_rules(&DetectConfig::default());
+        let findings = detect(&events, &rules);
+
+        let secret_findings: Vec<_> = findings
+            .iter()
+            .filter(|f| {
+                f.blocks
+                    .finding
+                    .as_ref()
+                    .and_then(|b| b.rule_id.as_deref())
+                    == Some("secret_in_diff")
+            })
+            .collect();
+        assert_eq!(
+            secret_findings.len(),
+            1,
+            "exactly one secret_in_diff finding expected; got {findings:#?}"
+        );
+        // It is a High finding correlated onto the session, with the class +
+        // file locator surfaced.
+        let f = secret_findings[0];
+        assert_eq!(finding_severity(f), Some(Severity::High));
+        assert_eq!(f.session_id.as_ref().map(SessionId::as_str), Some("sess-diff"));
+        assert_eq!(
+            f.attributes.get("secret_class").and_then(|v| v.as_str()),
+            Some("CLOUD_KEY")
         );
     }
 }

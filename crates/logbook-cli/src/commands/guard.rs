@@ -34,7 +34,9 @@ use logbook_inventory::endpoint::local_endpoint;
 use logbook_inventory::model::SessionTranscriptRecord;
 use logbook_inventory::store_ext;
 use logbook_inventory::wrapper::{self, LogbookOptions};
-use logbook_store::{Query, Store};
+use logbook_store::Store;
+#[cfg(test)]
+use logbook_store::Query;
 
 /// `logbook guard [opts] -- <agent...>`.
 #[derive(Debug, Args)]
@@ -96,9 +98,13 @@ fn run_in(args: GuardArgs, project: PathBuf, status: &mut impl Write) -> anyhow:
     let session_id = outcome.session.session_id.clone();
     let exit_code = outcome.session.exit_code;
 
-    // 2) Detect over the recorded session's (already-redacted) events.
+    // 2) Detect over the recorded session's (already-redacted) events. Route
+    //    through the SAME gather as `logbook detect` so the session's
+    //    `agent_actions` diffs are folded in as synthetic diff events — otherwise
+    //    `secret_in_diff` never fires on a guarded session's file diffs (they
+    //    live in `agent_actions`, not the `events` table).
     let store = Store::open_in_dir(&args.out_dir)?;
-    let events = store.query(&Query::new().session(session_id.clone()).oldest_first())?;
+    let events = super::detect::gather_session_events(&store, &session_id)?;
     let cfg = detect_config(&project);
     let rules = builtin_rules(&cfg);
     let findings = detect(&events, &rules);

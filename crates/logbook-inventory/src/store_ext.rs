@@ -243,6 +243,92 @@ pub fn insert_agent_actions(
     Ok(())
 }
 
+/// One recorded `agent_actions` row, projected for detection: the affected
+/// `path` (nullable in the schema), the redacted `diff` body (NULL when diffs
+/// were off or the file exceeded the baseline caps), and the owning session's
+/// `trace_id` (joined from `agent_sessions`, since `agent_actions` carries no
+/// trace column of its own; also nullable).
+///
+/// `logbook detect` / `logbook guard` fold these into the rule input as synthetic
+/// `Kind::Agent` diff events so the `secret_in_diff` rule sees the per-file diffs
+/// — the diffs that `logbook agent` stores here rather than in the `events`
+/// table.
+pub type AgentActionDiff = (Option<String>, Option<String>, Option<String>);
+
+/// Load a session's recorded `agent_actions` (oldest-first), each joined to its
+/// session's `trace_id`, for detection. Mirrors the read pattern in the UI's
+/// `query_actions` (`SELECT … FROM agent_actions WHERE session_id = ?1 ORDER BY
+/// observed_at ASC`) but pulls the columns the synthetic diff event needs: the
+/// `path`, the redacted `diff`, and the owning session's `trace_id` (a LEFT JOIN
+/// so an action survives even if the session header is missing a trace).
+///
+/// Everything returned is already redacted upstream by the wrapper — the `diff`
+/// is the redacted start→end content diff (plan §9), so callers only ever see the
+/// redaction *marker* a scrubbed secret leaves, never a raw value.
+///
+/// # Errors
+/// Returns a [`crate::InventoryError`] if the read fails.
+pub fn agent_actions_for_session(
+    store: &Store,
+    session_id: &str,
+) -> Result<Vec<AgentActionDiff>> {
+    let session_id = session_id.to_string();
+    let rows = store.read(move |conn| {
+        let mut stmt = conn.prepare(
+            "SELECT a.path, a.diff, s.trace_id \
+             FROM agent_actions a \
+             LEFT JOIN agent_sessions s ON s.id = a.session_id \
+             WHERE a.session_id = ?1 \
+             ORDER BY a.observed_at ASC",
+        )?;
+        let mapped = stmt
+            .query_map(params![session_id], |row| {
+                Ok((
+                    row.get::<_, Option<String>>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                ))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(mapped)
+    })?;
+    Ok(rows)
+}
+
+/// Load the most recent `agent_actions` across **all** sessions (newest-first,
+/// capped by `limit`), each joined to its session's `trace_id`, for the
+/// no-session `logbook detect` "what looks risky lately?" pass. Same projection
+/// and join as [`agent_actions_for_session`]; only the scope (all sessions, a
+/// recency cap) differs.
+///
+/// Like [`agent_actions_for_session`], everything returned is already redacted
+/// upstream by the wrapper.
+///
+/// # Errors
+/// Returns a [`crate::InventoryError`] if the read fails.
+pub fn recent_agent_action_diffs(store: &Store, limit: u32) -> Result<Vec<AgentActionDiff>> {
+    let rows = store.read(move |conn| {
+        let mut stmt = conn.prepare(
+            "SELECT a.path, a.diff, s.trace_id \
+             FROM agent_actions a \
+             LEFT JOIN agent_sessions s ON s.id = a.session_id \
+             ORDER BY a.observed_at DESC \
+             LIMIT ?1",
+        )?;
+        let mapped = stmt
+            .query_map(params![limit], |row| {
+                Ok((
+                    row.get::<_, Option<String>>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                ))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(mapped)
+    })?;
+    Ok(rows)
+}
+
 /// Insert (or replace) the `session_transcripts` row for a session (plan §1.3):
 /// pointers + metadata for the captured agent session's redacted transcript (the
 /// bulk bytes already live on disk). Keyed on `session_id`, so re-running the
