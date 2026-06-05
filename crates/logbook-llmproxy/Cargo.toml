@@ -1,0 +1,34 @@
+[package]
+name = "logbook-llmproxy"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Phase 4 Complete tier: an opt-in, loopback, bearer-gated LLM API proxy that forwards an agent's provider traffic upstream and records each call as a redacted Kind::Llm event (prompts/results force-redacted, SSE reassembled before redaction, gated on the complete tier)."
+
+[dependencies]
+logbook-core = { workspace = true }
+logbook-store = { workspace = true }
+# logbook-harness supplies HarnessContext, the shared redaction-before-
+# persistence surface (general redactor + mandatory secrets floor + per-class
+# caps). Referenced by path like the collector does — promote to a
+# [workspace.dependencies] entry once a third crate needs it.
+logbook-harness = { path = "../logbook-harness" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+async-trait = "0.1.83"
+axum = "0.8.9"
+tokio = { workspace = true, features = ["rt-multi-thread", "rt", "sync", "macros", "time", "net", "io-util", "signal"] }
+# Upstream HTTP client: reqwest over rustls (no OpenSSL), streaming bodies for
+# SSE reassembly. Used only by the real `ReqwestUpstream`; tests inject a mock
+# `Upstream` and never touch the network.
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+
+[dev-dependencies]
+tempfile = "3.27.0"
+tokio = { workspace = true, features = ["rt-multi-thread", "rt", "sync", "macros", "time", "net", "io-util", "signal", "test-util"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
