@@ -50,6 +50,13 @@ pub(crate) struct EventRow {
     pub status: String,
     pub error: Option<String>,
     pub session_id: Option<String>,
+    /// Zero-based turn index projected from the event's
+    /// [`AgentBlock::turn`](logbook_core::AgentBlock::turn) (V3 `events.turn`).
+    /// `None` when the event carries no agent block or that block has no turn.
+    /// Drives fast per-session turn grouping/filtering; the JSON `body` remains
+    /// the source of truth on read — this column is a denormalized projection
+    /// only.
+    pub turn: Option<i64>,
     /// The most-sensitive [`SensitivityClass`] present in this event, as its
     /// snake_case wire string (V2 `events.max_sensitivity`). Drives the
     /// per-class retention prune; `None` means unclassified (retained under the
@@ -133,6 +140,16 @@ pub(crate) fn event_to_row(event: &Event) -> Result<EventRow> {
         status: event.status.as_str().to_string(),
         error: event.error.clone(),
         session_id: event.session_id.as_ref().map(|s| s.as_str().to_string()),
+        // V3: denormalized projection of AgentBlock.turn for fast grouping.
+        // `None` when there is no agent block or no turn. The column is INTEGER
+        // (i64); turn indices are small so a saturating try_from is exact here,
+        // and the JSON body keeps the true u64 on read either way.
+        turn: event
+            .blocks
+            .agent
+            .as_ref()
+            .and_then(|a| a.turn)
+            .map(|t| i64::try_from(t).unwrap_or(i64::MAX)),
         max_sensitivity: max_sensitivity_for(event).map(|c| c.as_str().to_string()),
         body,
     })
@@ -186,6 +203,20 @@ mod tests {
         configure_connection(&conn).unwrap();
         embedded::migrations::runner()
             .set_target(Target::Version(1))
+            .run(&mut conn)
+            .unwrap();
+        conn
+    }
+
+    /// Open a connection and apply migrations only up to V2 — leaving the DB in
+    /// the exact pre-V3 shape (V2 columns/tables present, but no `events.turn`).
+    /// Refinery records V1+V2 in its history, so a later full run applies *only*
+    /// V3 (the genuine V2→V3 upgrade path, not a fresh build).
+    fn open_at_v2(path: &Path) -> Connection {
+        let mut conn = Connection::open(path).unwrap();
+        configure_connection(&conn).unwrap();
+        embedded::migrations::runner()
+            .set_target(Target::Version(2))
             .run(&mut conn)
             .unwrap();
         conn
@@ -378,8 +409,9 @@ mod tests {
     }
 
     #[test]
-    fn fresh_db_runs_both_migrations() {
-        // A from-scratch open applies V1+V2 in one go; the V2 surface is present.
+    fn fresh_db_runs_all_migrations() {
+        // A from-scratch open applies V1+V2+V3 in one go; the full surface is
+        // present (V2 capture-policy columns/table + the V3 `events.turn`).
         let dir = tempfile::tempdir().unwrap();
         let mut conn = Connection::open(dir.path().join("fresh.db")).unwrap();
         configure_connection(&conn).unwrap();
@@ -387,5 +419,102 @@ mod tests {
         assert!(has_column(&conn, "events", "max_sensitivity"));
         assert!(has_column(&conn, "agent_actions", "revert_safe"));
         assert!(has_table(&conn, "session_transcripts"));
+        assert!(has_column(&conn, "events", "turn"), "V3 events.turn present");
+    }
+
+    #[test]
+    fn v3_migration_is_incremental_and_idempotent_on_a_v2_db() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("logbook.db");
+
+        // (1) Build a V2-shaped DB and assert the V3 `turn` column is ABSENT.
+        let conn = open_at_v2(&db);
+        assert!(
+            has_column(&conn, "events", "max_sensitivity"),
+            "sanity: V2 surface is present"
+        );
+        assert!(
+            !has_column(&conn, "events", "turn"),
+            "events.turn must not exist at V2"
+        );
+
+        // Insert an event through the V2 column set (15 cols, no `turn`) so we
+        // have a pre-existing "old" row to read back after the V3 upgrade.
+        conn.execute(
+            "INSERT INTO events \
+             (id, trace_id, parent_id, timestamp, duration_ms, kind, type, \
+              category, operation, name, status, error, session_id, \
+              max_sensitivity, body) \
+             VALUES ('old-1','aa','', 100, NULL, 'log', 'stdout', 'app_log', \
+              'log', 'old line', 'unset', NULL, NULL, NULL, '{}')",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        // (2) Reopen at the latest target → refinery applies ONLY V3 on top.
+        let mut conn = Connection::open(&db).unwrap();
+        configure_connection(&conn).unwrap();
+        run_migrations(&mut conn).unwrap();
+
+        // V3 column + its index now exist.
+        assert!(has_column(&conn, "events", "turn"));
+        let idx: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM sqlite_master \
+                 WHERE type='index' AND name='idx_events_turn'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(idx, 1, "idx_events_turn must exist after V3");
+
+        // (3) The pre-existing row reads NULL for the new nullable `turn` column.
+        let old_turn: Option<i64> = conn
+            .query_row("SELECT turn FROM events WHERE id='old-1'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(old_turn, None, "old events row must read turn=NULL");
+
+        // (4) Running migrations again is a no-op (refinery skips applied).
+        run_migrations(&mut conn).unwrap();
+        assert!(has_column(&conn, "events", "turn"));
+
+        // (5) New inserts can carry a non-NULL turn through the V3 column.
+        conn.execute(
+            "INSERT INTO events \
+             (id, trace_id, parent_id, timestamp, duration_ms, kind, type, \
+              category, operation, name, status, error, session_id, turn, \
+              max_sensitivity, body) \
+             VALUES ('new-1','bb','', 200, NULL, 'agent', 'step', 'agent', \
+              'step', 'turn 5', 'unset', NULL, 'sess-1', 5, 'transcript', '{}')",
+            [],
+        )
+        .unwrap();
+        let new_turn: Option<i64> = conn
+            .query_row("SELECT turn FROM events WHERE id='new-1'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(new_turn, Some(5));
+    }
+
+    #[test]
+    fn event_to_row_projects_agent_turn() {
+        let trace = TraceId::new();
+
+        // An agent block with a turn → `turn` column carries it.
+        let with_turn = Event::new(trace, Kind::Agent, Category::Agent, "step")
+            .with_agent(AgentBlock {
+                turn: Some(7),
+                ..Default::default()
+            });
+        assert_eq!(event_to_row(&with_turn).unwrap().turn, Some(7));
+
+        // An agent block without a turn → NULL.
+        let no_turn = Event::new(trace, Kind::Agent, Category::Agent, "step")
+            .with_agent(AgentBlock::default());
+        assert_eq!(event_to_row(&no_turn).unwrap().turn, None);
+
+        // A non-agent event → NULL (no agent block to project from).
+        let log = Event::new(trace, Kind::Log, Category::AppLog, "stdout");
+        assert_eq!(event_to_row(&log).unwrap().turn, None);
     }
 }

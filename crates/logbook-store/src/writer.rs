@@ -154,8 +154,8 @@ fn open_reader(path: &Path) -> Result<Connection> {
 
 const INSERT_SQL: &str = "INSERT OR REPLACE INTO events \
     (id, trace_id, parent_id, timestamp, duration_ms, kind, type, category, \
-     operation, name, status, error, session_id, max_sensitivity, body) \
-    VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)";
+     operation, name, status, error, session_id, turn, max_sensitivity, body) \
+    VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)";
 
 fn insert_one(conn: &Connection, event: &Event) -> Result<()> {
     let row = event_to_row(event)?;
@@ -175,6 +175,7 @@ fn insert_one(conn: &Connection, event: &Event) -> Result<()> {
             row.status,
             row.error,
             row.session_id,
+            row.turn,
             row.max_sensitivity,
             row.body,
         ],
@@ -202,6 +203,7 @@ fn insert_batch(conn: &mut Connection, events: &[Event]) -> Result<()> {
                 row.status,
                 row.error,
                 row.session_id,
+                row.turn,
                 row.max_sensitivity,
                 row.body,
             ])?;

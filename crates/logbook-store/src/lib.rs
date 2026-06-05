@@ -45,7 +45,9 @@ use logbook_core::Event;
 
 pub use error::{Result, StoreError};
 pub use jsonl::{read_jsonl, read_jsonl_opt, JsonlWriter, JSONL_FILENAME};
-pub use query::{count_events, get_trace, query_events, Query};
+pub use query::{
+    count_events, get_trace, query_events, token_cost_rollup, CostRow, Query,
+};
 
 use writer::StoreInner;
 
