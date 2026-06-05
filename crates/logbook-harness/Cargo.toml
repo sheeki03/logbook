@@ -1,0 +1,12 @@
+[package]
+name = "logbook-harness"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Harness adapters (Claude Code, Codex, Aider): normalize hook/session-log records into redacted logbook Events (Phase 2, opt-in)."
+
+[dependencies]
+logbook-core = { workspace = true }
+serde_json = { workspace = true }

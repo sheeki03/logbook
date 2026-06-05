@@ -976,6 +976,7 @@ dependencies = [
  "logbook-core",
  "logbook-debug",
  "logbook-export",
+ "logbook-harness",
  "logbook-inventory",
  "logbook-mcp",
  "logbook-security",
@@ -998,6 +999,7 @@ dependencies = [
  "axum",
  "libc",
  "logbook-core",
+ "logbook-harness",
  "logbook-store",
  "reqwest",
  "serde",
@@ -1048,6 +1050,14 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 2.0.18",
+]
+
+[[package]]
+name = "logbook-harness"
+version = "0.1.0"
+dependencies = [
+ "logbook-core",
+ "serde_json",
 ]
 
 [[package]]
