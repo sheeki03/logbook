@@ -20,6 +20,30 @@
 //! process dies, removing `collector.json` / `collector.token` only when the
 //! recorded pid still matches.
 //!
+//! ### Phase 2 — structured agent capture (`[new]`)
+//! Two further bearer-gated routes ingest *structured* records (plan
+//! "Phase 2", Ingest/OTLP row), reusing the same [`IngestToken`] auth + the
+//! capture policy:
+//! - **`POST /v1/hooks`** — a harness hook record (Claude Code
+//!   `PreToolUse`/`PostToolUse`/`UserPromptSubmit`/`Stop`, or a session-log
+//!   line) normalized via the [`logbook_harness`] adapters into redacted
+//!   [`Event`]s and `insert_batch`ed;
+//! - **`POST /v1/traces`** — a minimal OTLP-JSON spans envelope mapped to
+//!   `Kind::Span` events (redacted names/attributes).
+//!
+//! `/ingest` now also honors the **`browser_data`** capture-policy class gate
+//! ([`CollectorConfig::with_capture_policy`]): when that class is off the batch
+//! is dropped (accepted, not persisted), so a paused capture toggle silences
+//! passive browser ingest.
+//!
+//! ## MCP proxy ([`LoggingMcpTransport`] + [`mcp_proxy`])
+//! [`LoggingMcpTransport`] decorates any [`McpTransport`] and persists a
+//! redacted `Kind::Tool` [`Event`] for every `tools/call` (arguments under the
+//! `tool_args` class, result under `tool_results`). [`run_mcp_proxy`] runs
+//! `logbook` as a **stdio passthrough proxy in the middle**: it spawns a real
+//! MCP server and forwards an agent's JSON-RPC through the logging transport,
+//! recording every call while relaying responses verbatim.
+//!
 //! ## Browser capture
 //! In v1 the [`BrowserCapture`] trait has a single impl, [`InjectedJsAdapter`]:
 //! - [`InjectedJsAdapter`] — produces a JS shim (hooks `console.*`,
@@ -43,6 +67,8 @@ pub mod collector;
 pub mod egress;
 pub mod error;
 pub mod injected;
+pub mod logging_mcp;
+pub mod mcp_proxy;
 pub mod schrute_mcp;
 pub mod token;
 pub mod watchdog;
@@ -56,5 +82,7 @@ pub use collector::{
 pub use egress::{EgressAllowlist, EgressDenied};
 pub use error::CollectorError;
 pub use injected::InjectedJsAdapter;
+pub use logging_mcp::LoggingMcpTransport;
+pub use mcp_proxy::{pump as mcp_proxy_pump, run_mcp_proxy, McpProxyConfig, ProxyOutcome};
 pub use schrute_mcp::{McpTransport, SchruteAdapter, SchruteError, SchruteOp, StdioTransport};
 pub use token::{IngestToken, TokenMode, ENV_VAR as INGEST_TOKEN_ENV};

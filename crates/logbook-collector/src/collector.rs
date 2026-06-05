@@ -25,7 +25,11 @@ use tokio::sync::oneshot;
 use tower_http::cors::{AllowOrigin, CorsLayer};
 
 use logbook_core::text::truncate_with_ellipsis;
-use logbook_core::{Category, ConsoleBlock, Event, Kind, Redactor, Status, TraceId};
+use logbook_core::{
+    CapturePolicy, Category, ConsoleBlock, Event, Kind, MicrosTimestamp, Redactor, SensitivityClass,
+    SessionId, Status, TraceId,
+};
+use logbook_harness::{ClaudeCodeAdapter, HarnessAdapter, HarnessContext};
 use logbook_store::Store;
 
 use crate::error::CollectorError;
@@ -66,6 +70,13 @@ pub struct CollectorConfig {
     pub token_mode: TokenMode,
     /// Whether redaction is enabled (default true; plan §9).
     pub redact: bool,
+    /// The capture policy gating per-class persistence. Consulted at the
+    /// persistence boundary for the `browser_data` class on `/ingest` and for
+    /// the `prompts`/`tool_*`/`model_metadata` classes on `/v1/hooks` /
+    /// `/v1/traces` (plan §"Capture policy", collector rows). Defaults to the
+    /// recorder-on [`CapturePolicy::default`], so existing behavior is unchanged
+    /// (every class on).
+    pub capture_policy: CapturePolicy,
     /// Parent PID to watch; when it dies the collector shuts down. `None`
     /// disables the watchdog (useful in tests).
     pub parent_pid: Option<i32>,
@@ -83,6 +94,7 @@ impl CollectorConfig {
             dev_origin: dev_origin.into(),
             token_mode: TokenMode::Generated,
             redact: true,
+            capture_policy: CapturePolicy::default(),
             parent_pid: crate::watchdog::parent_pid(),
         }
     }
@@ -105,6 +117,14 @@ impl CollectorConfig {
     #[must_use]
     pub fn without_redaction(mut self) -> Self {
         self.redact = false;
+        self
+    }
+
+    /// Set the capture policy (per-class persistence gate). The recorder-on
+    /// [`CapturePolicy::default`] is used otherwise.
+    #[must_use]
+    pub fn with_capture_policy(mut self, policy: CapturePolicy) -> Self {
+        self.capture_policy = policy;
         self
     }
 
@@ -142,8 +162,33 @@ pub struct CollectorRecord {
 struct AppState {
     store: Arc<Store>,
     redactor: Arc<Redactor>,
+    /// The resolved capture policy (per-class persistence gate). Consulted for
+    /// the `browser_data` gate on `/ingest` and threaded into the per-request
+    /// [`HarnessContext`] for `/v1/hooks` + `/v1/traces`.
+    policy: Arc<CapturePolicy>,
+    /// Whether the **general** redactor is enabled (i.e. not `--no-redact`).
+    /// Threaded into each request's [`HarnessContext`]; the mandatory secrets
+    /// floor always applies regardless.
+    redact: bool,
     token: IngestToken,
     record: Arc<CollectorRecord>,
+}
+
+impl AppState {
+    /// Build a fresh [`HarnessContext`] for one request: a general redactor
+    /// gated by [`Self::redact`] (disabled under `--no-redact`) over the
+    /// resolved capture policy. The context constructs + always applies the
+    /// mandatory secrets floor internally, so a secret can never reach an
+    /// `Event` even when the general layer is off. Built per request because
+    /// [`HarnessContext`] is not `Clone` ([`Redactor`] is not `Clone`).
+    fn harness_context(&self) -> HarnessContext {
+        let general = if self.redact {
+            Redactor::new()
+        } else {
+            Redactor::disabled()
+        };
+        HarnessContext::new(general, (*self.policy).clone(), self.redact)
+    }
 }
 
 /// A running collector handle: the bound address, the resolved token, and a
@@ -302,6 +347,8 @@ pub async fn start(
     let state = AppState {
         store: Arc::new(store),
         redactor: Arc::new(redactor),
+        policy: Arc::new(config.capture_policy.clone()),
+        redact: config.redact,
         token: token.clone(),
         record: Arc::new(record),
     };
@@ -391,6 +438,8 @@ fn build_router(state: AppState, dev_origin: &str) -> Result<Router, CollectorEr
     Ok(Router::new()
         .route("/health", get(health))
         .route("/ingest", post(ingest))
+        .route("/v1/hooks", post(ingest_hooks))
+        .route("/v1/traces", post(ingest_traces))
         .layer(cors)
         .with_state(state))
 }
@@ -426,6 +475,14 @@ async fn ingest(
         Err(_) => return (StatusCode::BAD_REQUEST, "invalid JSON").into_response(),
     };
 
+    // `browser_data` capture-policy gate (plan: "a *new* collector-side gate;
+    // today `/ingest` is not class-gated"). When the class is off, drop the
+    // batch — accept the request (204) but persist nothing, so a paused capture
+    // toggle silences passive browser ingest without erroring the client.
+    if !state.policy.should_capture(SensitivityClass::BrowserData) {
+        return StatusCode::NO_CONTENT.into_response();
+    }
+
     let raw_events = extract_events(payload);
 
     // One trace ties this ingest batch together (browser lane).
@@ -442,6 +499,133 @@ async fn ingest(
         }
     }
 
+    StatusCode::NO_CONTENT.into_response()
+}
+
+/// `POST /v1/hooks` — ingest a harness **hook** record (Claude Code
+/// `PreToolUse`/`PostToolUse`/`UserPromptSubmit`/`Stop`, or a session-log line),
+/// normalize it via the [`logbook_harness`] adapters, and persist the resulting
+/// redacted events. Bearer-gated exactly like `/ingest`.
+///
+/// The body is a single hook record object (or a `{records:[...]}` / bare array
+/// of them). A top-level `trace` (32-hex) and `session` field may be supplied to
+/// tie the events to an existing session; otherwise a fresh trace is minted.
+/// Unrecognized records normalize to zero events (the adapter is tolerant),
+/// yielding `204` with nothing persisted.
+///
+/// **Redaction-before-persistence** (plan §9): every prompt / tool arg / tool
+/// result is scrubbed by the adapter's [`HarnessContext`] before it becomes an
+/// event — the handler never builds an event holding a raw secret.
+async fn ingest_hooks(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Result<Json<Value>, axum::extract::rejection::JsonRejection>,
+) -> Response {
+    if !authorize(&state.token, &headers) {
+        return (StatusCode::UNAUTHORIZED, "unauthorized").into_response();
+    }
+    let payload = match body {
+        Ok(Json(v)) => v,
+        Err(_) => return (StatusCode::BAD_REQUEST, "invalid JSON").into_response(),
+    };
+
+    // Capture-policy gate (mirrors the `/ingest` browser_data gate). Hook records
+    // normalize into `prompts` / `tool_args` / `tool_results` / `model_metadata`
+    // events — all structured-tier classes. When the master switch is paused or
+    // the structured tier is off, *none* of these classes is captured, so persist
+    // nothing: accept the request (204) but drop the batch, so a master-pause /
+    // structured-tier-off silences hook ingest just like it silences `/ingest`.
+    // (Per-class redaction/omission inside the adapter is unchanged; this is the
+    // missing producer-level master gate.)
+    if !structured_capture_open(&state.policy) {
+        return StatusCode::NO_CONTENT.into_response();
+    }
+
+    // Optional trace/session correlation from the body (a fresh trace otherwise).
+    let trace = payload
+        .get("trace")
+        .or_else(|| payload.get("trace_id"))
+        .and_then(Value::as_str)
+        .and_then(parse_trace_hex)
+        .unwrap_or_else(TraceId::new);
+    let session = payload
+        .get("session")
+        .or_else(|| payload.get("session_id"))
+        .and_then(Value::as_str)
+        .map(SessionId::new);
+
+    let records = extract_records(&payload);
+    if records.is_empty() {
+        return StatusCode::NO_CONTENT.into_response();
+    }
+
+    // Build a per-request harness context (redactor + policy) mirroring the
+    // server's resolved posture; the adapter routes every payload through it.
+    let ctx = state.harness_context();
+    let adapter = ClaudeCodeAdapter::new(trace, ctx, harness_version_of(&payload));
+
+    let mut events: Vec<Event> = Vec::new();
+    for rec in &records {
+        for mut ev in adapter.parse_record(rec) {
+            if let Some(s) = &session {
+                ev = ev.with_session(s.clone());
+            }
+            events.push(ev);
+        }
+    }
+
+    if !events.is_empty() {
+        if let Err(e) = state.store.insert_batch(events) {
+            tracing::error!(error = %e, "failed to persist hook events");
+            return (StatusCode::INTERNAL_SERVER_ERROR, "store error").into_response();
+        }
+    }
+    StatusCode::NO_CONTENT.into_response()
+}
+
+/// `POST /v1/traces` — a **minimal OTLP-JSON** spans receiver: map each span in
+/// the standard `resourceSpans[].scopeSpans[].spans[]` envelope to an [`Event`]
+/// and persist it. Bearer-gated like `/ingest`.
+///
+/// This is intentionally small (the inverse of `logbook-export`'s OTLP shape):
+/// it reads `traceId`/`spanId`/`parentSpanId` (hex), `name`, `startTimeUnixNano`,
+/// `status.code`, and string `attributes`, producing a `Kind::Span` /
+/// `Category::Agent` event. Span `name` + string attribute **values** are routed
+/// through the harness context (`tool_args` class) so any secret is redacted
+/// before persistence. Unparseable / empty envelopes yield `204` with nothing
+/// stored.
+async fn ingest_traces(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Result<Json<Value>, axum::extract::rejection::JsonRejection>,
+) -> Response {
+    if !authorize(&state.token, &headers) {
+        return (StatusCode::UNAUTHORIZED, "unauthorized").into_response();
+    }
+    let payload = match body {
+        Ok(Json(v)) => v,
+        Err(_) => return (StatusCode::BAD_REQUEST, "invalid JSON").into_response(),
+    };
+
+    // Capture-policy gate (mirrors the `/ingest` browser_data gate). OTLP spans
+    // are persisted with their name + string attributes routed through the
+    // `tool_args` class, so gate on it: when the master switch is paused or the
+    // structured tier is off, `tool_args` is not captured and we persist nothing
+    // (accept with 204, drop the batch). Without this gate a master-pause /
+    // structured-tier-off would not stop `/v1/traces`.
+    if !state.policy.should_capture(SensitivityClass::ToolArgs) {
+        return StatusCode::NO_CONTENT.into_response();
+    }
+
+    let ctx = state.harness_context();
+    let events = otlp_spans_to_events(&payload, &ctx);
+
+    if !events.is_empty() {
+        if let Err(e) = state.store.insert_batch(events) {
+            tracing::error!(error = %e, "failed to persist OTLP spans");
+            return (StatusCode::INTERNAL_SERVER_ERROR, "store error").into_response();
+        }
+    }
     StatusCode::NO_CONTENT.into_response()
 }
 
@@ -616,6 +800,203 @@ fn stringify_value(value: &Value) -> String {
         Value::Bool(b) => b.to_string(),
         Value::Number(n) => n.to_string(),
         other => serde_json::to_string(other).unwrap_or_default(),
+    }
+}
+
+// ---- /v1/hooks helpers ---------------------------------------------------
+
+/// Parse a 32-hex-char trace id into a [`TraceId`], returning `None` on a bad
+/// length or non-hex input (the caller mints a fresh trace instead).
+fn parse_trace_hex(hex: &str) -> Option<TraceId> {
+    let hex = hex.trim();
+    if hex.len() != TraceId::HEX_LEN {
+        return None;
+    }
+    let mut bytes = [0u8; TraceId::LEN];
+    for (i, b) in bytes.iter_mut().enumerate() {
+        let s = hex.get(i * 2..i * 2 + 2)?;
+        *b = u8::from_str_radix(s, 16).ok()?;
+    }
+    if bytes == [0u8; TraceId::LEN] {
+        return None;
+    }
+    Some(TraceId::from_bytes(bytes))
+}
+
+/// Pull the hook record(s) out of a `/v1/hooks` body: a single record object,
+/// a `{records:[...]}` wrapper, or a bare array. The record(s) returned are the
+/// raw harness JSON the adapter understands. A wrapper object's correlation
+/// fields (`trace`/`session`) are read by the caller, not here.
+fn extract_records(payload: &Value) -> Vec<Value> {
+    match payload {
+        Value::Array(items) => items.clone(),
+        Value::Object(map) => {
+            if let Some(Value::Array(items)) = map.get("records") {
+                items.clone()
+            } else if map.contains_key("record") {
+                vec![map.get("record").cloned().unwrap_or(Value::Null)]
+            } else {
+                // A bare hook record object (the common case).
+                vec![payload.clone()]
+            }
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// The harness version to stamp on hook events: an explicit `harness_version`
+/// body field, else `"unknown"`.
+fn harness_version_of(payload: &Value) -> String {
+    payload
+        .get("harness_version")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown")
+        .to_string()
+}
+
+/// Whether *any* structured-tier content class a hook record can emit is
+/// captured under `policy`. A hook normalizes into `prompts` / `tool_args` /
+/// `tool_results` / `model_metadata` events; all four are gated by the master
+/// switch (`enabled`) and the `structured` tier. When the master switch is
+/// paused or the structured tier is off, none is captured and `/v1/hooks`
+/// persists nothing (the producer-level gate that mirrors the `/ingest`
+/// `browser_data` gate). Returning `true` here does **not** relax per-class
+/// redaction/omission inside the adapter.
+fn structured_capture_open(policy: &CapturePolicy) -> bool {
+    policy.should_capture(SensitivityClass::Prompts)
+        || policy.should_capture(SensitivityClass::ToolArgs)
+        || policy.should_capture(SensitivityClass::ToolResults)
+        || policy.should_capture(SensitivityClass::ModelMetadata)
+}
+
+// ---- /v1/traces (minimal OTLP-JSON) --------------------------------------
+
+/// Map a minimal OTLP-JSON spans envelope to [`Event`]s. Walks
+/// `resourceSpans[].scopeSpans[].spans[]` (the standard OTLP/JSON shape), and
+/// for each span produces a `Kind::Span` / `Category::Agent` event. The span
+/// `name` and string attribute **values** are redacted via `ctx` (tool_args
+/// class) before they land on the event; numbers/bools are kept as-is.
+fn otlp_spans_to_events(payload: &Value, ctx: &HarnessContext) -> Vec<Event> {
+    let mut out = Vec::new();
+    let Some(resource_spans) = payload.get("resourceSpans").and_then(Value::as_array) else {
+        return out;
+    };
+    for rs in resource_spans {
+        let Some(scope_spans) = rs.get("scopeSpans").and_then(Value::as_array) else {
+            continue;
+        };
+        for ss in scope_spans {
+            let Some(spans) = ss.get("spans").and_then(Value::as_array) else {
+                continue;
+            };
+            for span in spans {
+                if let Some(ev) = otlp_span_to_event(span, ctx) {
+                    out.push(ev);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Convert one OTLP span object into an [`Event`]. Returns `None` only if the
+/// span carries no usable `traceId`.
+fn otlp_span_to_event(span: &Value, ctx: &HarnessContext) -> Option<Event> {
+    let trace = span
+        .get("traceId")
+        .and_then(Value::as_str)
+        .and_then(parse_trace_hex)?;
+
+    let raw_name = span.get("name").and_then(Value::as_str).unwrap_or("span");
+    // Redact the span name (it can embed args/urls); tool_args class + floor.
+    let (name, _trunc) = ctx.redact_text(SensitivityClass::ToolArgs, raw_name);
+
+    let mut ev = Event::new(trace, Kind::Span, Category::Agent, "otlp.span")
+        .with_op("span")
+        .with_name(truncate_with_ellipsis(&name, 120))
+        .with_attr("source", "otlp");
+
+    // Parent span id (16-hex) → SpanId for the turn/step tree.
+    if let Some(parent) = span
+        .get("parentSpanId")
+        .and_then(Value::as_str)
+        .and_then(parse_span_hex)
+    {
+        ev = ev.with_parent(parent);
+    }
+
+    // Start time: OTLP uses nanoseconds since the epoch; the store is micros.
+    if let Some(nanos) = span
+        .get("startTimeUnixNano")
+        .and_then(otlp_u64)
+    {
+        ev.timestamp = MicrosTimestamp((nanos / 1_000) as i64);
+    }
+
+    // Status: OTLP StatusCode 2 = ERROR, 1 = OK, 0 = UNSET.
+    let status_code = span
+        .get("status")
+        .and_then(|s| s.get("code"))
+        .and_then(otlp_u64)
+        .unwrap_or(0);
+    if status_code == 2 {
+        let raw_msg = span
+            .get("status")
+            .and_then(|s| s.get("message"))
+            .and_then(Value::as_str)
+            .unwrap_or("span errored");
+        let (msg, _t) = ctx.redact_text(SensitivityClass::ToolArgs, raw_msg);
+        ev = ev.with_error(msg);
+    } else if status_code == 1 {
+        ev = ev.with_status(Status::Ok);
+    }
+
+    // String attributes (OTLP KeyValue list) → redacted event attributes.
+    if let Some(attrs) = span.get("attributes").and_then(Value::as_array) {
+        for kv in attrs {
+            let Some(key) = kv.get("key").and_then(Value::as_str) else {
+                continue;
+            };
+            let Some(val) = kv.get("value") else { continue };
+            if let Some(s) = val.get("stringValue").and_then(Value::as_str) {
+                let (red, _t) = ctx.redact_text(SensitivityClass::ToolArgs, s);
+                ev = ev.with_attr(key.to_string(), red);
+            } else if let Some(i) = val.get("intValue").and_then(otlp_u64) {
+                ev = ev.with_attr(key.to_string(), i);
+            } else if let Some(b) = val.get("boolValue").and_then(Value::as_bool) {
+                ev = ev.with_attr(key.to_string(), b);
+            }
+        }
+    }
+
+    ev.debug_assert_valid();
+    Some(ev)
+}
+
+/// Parse a 16-hex-char span id into a [`SpanId`] (OTLP `parentSpanId`).
+fn parse_span_hex(hex: &str) -> Option<logbook_core::SpanId> {
+    let hex = hex.trim();
+    if hex.len() != logbook_core::SpanId::HEX_LEN {
+        return None;
+    }
+    let mut bytes = [0u8; logbook_core::SpanId::LEN];
+    for (i, b) in bytes.iter_mut().enumerate() {
+        let s = hex.get(i * 2..i * 2 + 2)?;
+        *b = u8::from_str_radix(s, 16).ok()?;
+    }
+    if bytes == [0u8; logbook_core::SpanId::LEN] {
+        return None;
+    }
+    Some(logbook_core::SpanId::from_bytes(bytes))
+}
+
+/// OTLP/JSON encodes 64-bit integers as either a JSON number or a decimal
+/// string. Accept both.
+fn otlp_u64(value: &Value) -> Option<u64> {
+    match value {
+        Value::Number(n) => n.as_u64(),
+        Value::String(s) => s.trim().parse::<u64>().ok(),
+        _ => None,
     }
 }
 

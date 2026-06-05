@@ -100,6 +100,23 @@ pub trait McpTransport: Send {
     /// # Errors
     /// Implementations return [`SchruteError::Transport`] on I/O failure.
     fn request(&mut self, request: Value) -> Result<Value, SchruteError>;
+
+    /// Send a one-way JSON-RPC **notification** (a frame with no `id`, e.g.
+    /// `notifications/initialized`) for which **no response is awaited**.
+    ///
+    /// Used by the passthrough proxy ([`crate::mcp_proxy`]) to forward an
+    /// agent's notification frames to a real server without blocking on a reply.
+    /// The default implementation is a best-effort **no-op** (a notification is
+    /// fire-and-forget; a transport with no real downstream — a mock or the
+    /// schrute adapter, which never forwards client notifications — simply drops
+    /// it). [`StdioTransport`] overrides this to write the frame to the child's
+    /// stdin.
+    ///
+    /// # Errors
+    /// Implementations return [`SchruteError::Transport`] on I/O failure.
+    fn notify(&mut self, _notification: Value) -> Result<(), SchruteError> {
+        Ok(())
+    }
 }
 
 /// An MCP client to schrute over a [`McpTransport`], enforcing logbook's
@@ -574,6 +591,20 @@ impl McpTransport for StdioTransport {
                 }
             }
         }
+    }
+
+    fn notify(&mut self, notification: Value) -> Result<(), SchruteError> {
+        use std::io::Write;
+        // Fire-and-forget: write the frame and flush; never wait for a reply (a
+        // notification has no `id`). Used by the passthrough proxy to forward an
+        // agent's notifications to the real server.
+        let line = serde_json::to_string(&notification)
+            .map_err(|e| SchruteError::Malformed(e.to_string()))?;
+        self.stdin
+            .write_all(line.as_bytes())
+            .and_then(|_| self.stdin.write_all(b"\n"))
+            .and_then(|_| self.stdin.flush())
+            .map_err(|e| SchruteError::Transport(format!("notify write: {e}")))
     }
 }
 

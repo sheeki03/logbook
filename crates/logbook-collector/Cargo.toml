@@ -10,6 +10,10 @@ description = "axum /health + /ingest collector and browser-capture adapters."
 [dependencies]
 logbook-core = { workspace = true }
 logbook-store = { workspace = true }
+# logbook-harness is referenced by path: it is not (yet) declared in
+# [workspace.dependencies], and Phase 2 only the collector consumes it (for the
+# /v1/hooks adapters). Promote to a workspace dep when a second crate needs it.
+logbook-harness = { path = "../logbook-harness" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 anyhow = { workspace = true }

@@ -351,6 +351,381 @@ async fn off_token_mode_allows_unauthenticated_ingest() {
 }
 
 #[tokio::test]
+async fn hooks_401_without_token_and_normalizes_a_sample_hook() {
+    // `/v1/hooks` is bearer-gated exactly like `/ingest`, and a valid PostToolUse
+    // hook normalizes into a redacted Kind::Tool event, persisted in the Agent
+    // lane under the supplied trace.
+    let (running, store, _dir) = start_test_collector().await;
+    let url = format!("http://127.0.0.1:{}/v1/hooks", running.port());
+    let token = running.token().unwrap().to_string();
+    let client = reqwest::Client::new();
+
+    // A planted secret in the tool result must NOT survive into the store.
+    let hook = serde_json::json!({
+        "trace": "aabbccddeeff00112233445566778899",
+        "session": "sess-hook-1",
+        "harness_version": "1.9.9",
+        "hook_event_name": "PostToolUse",
+        "tool_name": "Bash",
+        "tool_use_id": "toolu_7",
+        "tool_input": { "command": "deploy", "token": "AKIAIOSFODNN7EXAMPLE" },
+        "tool_response": { "stdout": "deployed with AKIAIOSFODNN7EXAMPLE", "stderr": "" }
+    });
+
+    // Wrong bearer -> 401, nothing persisted.
+    let bad = client
+        .post(&url)
+        .bearer_auth("not-the-token")
+        .json(&hook)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(bad.status(), 401, "bad bearer must be rejected");
+    assert_eq!(store.count().unwrap(), 0, "rejected hook must not persist");
+
+    // Correct bearer -> 204 + one redacted tool event.
+    let ok = client.post(&url).bearer_auth(&token).json(&hook).send().await.unwrap();
+    assert_eq!(ok.status(), 204, "valid hook accepted");
+
+    let events = store
+        .query(&Query::new().category(logbook_core::Category::Agent).limit(100))
+        .unwrap();
+    assert_eq!(events.len(), 1, "PostToolUse hook → one tool event");
+    let ev = &events[0];
+    assert_eq!(ev.kind, logbook_core::Kind::Tool);
+    // Correlated to the supplied trace + session.
+    assert_eq!(ev.trace_id.to_hex(), "aabbccddeeff00112233445566778899");
+    assert_eq!(
+        ev.session_id.as_ref().map(logbook_core::SessionId::as_str),
+        Some("sess-hook-1")
+    );
+    let tb = ev.blocks.tool.as_ref().expect("tool block");
+    assert_eq!(tb.tool_name.as_deref(), Some("Bash"));
+    // Arguments + result redacted before persistence (plan §9).
+    let args_s = serde_json::to_string(tb.arguments.as_ref().unwrap()).unwrap();
+    assert!(!args_s.contains("AKIAIOSFODNN7EXAMPLE"), "secret leaked in args: {args_s}");
+    assert!(args_s.contains("deploy"), "non-secret arg lost: {args_s}");
+    if let Some(out) = ev.output.as_ref().and_then(|o| o.as_str()) {
+        assert!(!out.contains("AKIAIOSFODNN7EXAMPLE"), "secret leaked in result: {out}");
+    }
+    // harness_version stamped.
+    assert_eq!(
+        ev.attributes.get("harness_version").and_then(|v| v.as_str()),
+        Some("1.9.9")
+    );
+
+    running.shutdown().await;
+}
+
+#[tokio::test]
+async fn hooks_skip_unknown_records_with_no_persist() {
+    // An unrecognized hook record normalizes to zero events → 204, nothing stored
+    // (the adapter is tolerant).
+    let (running, store, _dir) = start_test_collector().await;
+    let url = format!("http://127.0.0.1:{}/v1/hooks", running.port());
+    let token = running.token().unwrap().to_string();
+
+    let resp = reqwest::Client::new()
+        .post(&url)
+        .bearer_auth(&token)
+        .json(&serde_json::json!({ "totally": "unknown", "shape": true }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 204);
+    assert_eq!(store.count().unwrap(), 0, "unknown record persists nothing");
+
+    running.shutdown().await;
+}
+
+#[tokio::test]
+async fn ingest_drops_when_browser_data_class_off() {
+    // The new browser_data capture gate: with the class off, /ingest accepts the
+    // request (204) but persists NOTHING. With it on (default), it persists.
+    use logbook_core::CapturePolicy;
+
+    // ---- class OFF: dropped ----
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open_in_dir(dir.path()).unwrap();
+    let mut policy = CapturePolicy::default();
+    policy.classes.browser_data.capture = false;
+    let config = CollectorConfig::new(dir.path(), ORIGIN)
+        .with_port(0)
+        .with_parent_pid(None)
+        .with_capture_policy(policy);
+    let running = start(config, store.clone()).await.unwrap();
+    let url = format!("http://127.0.0.1:{}/ingest", running.port());
+    let token = running.token().unwrap().to_string();
+
+    let resp = reqwest::Client::new()
+        .post(&url)
+        .bearer_auth(&token)
+        .json(&serde_json::json!({"events": [{"message": "should be dropped"}]}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 204, "request still accepted when class off");
+    assert_eq!(store.count().unwrap(), 0, "browser_data off ⇒ nothing persisted");
+    running.shutdown().await;
+
+    // ---- class ON (default): persisted ----
+    let (running2, store2, _dir2) = start_test_collector().await;
+    let url2 = format!("http://127.0.0.1:{}/ingest", running2.port());
+    let token2 = running2.token().unwrap().to_string();
+    let resp2 = reqwest::Client::new()
+        .post(&url2)
+        .bearer_auth(&token2)
+        .json(&serde_json::json!({"events": [{"message": "kept"}]}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp2.status(), 204);
+    assert_eq!(store2.count().unwrap(), 1, "default policy persists browser events");
+    running2.shutdown().await;
+}
+
+#[tokio::test]
+async fn hooks_drop_when_capture_paused() {
+    // Regression: `/v1/hooks` must honor the capture policy. Today only `/ingest`
+    // is class-gated, so a master-pause or structured-tier-off does NOT stop hook
+    // ingest. With either off, a valid PostToolUse hook (which would otherwise
+    // persist a redacted Kind::Tool event) must persist NOTHING — accepted (204)
+    // but dropped — mirroring the `/ingest` browser_data gate.
+    use logbook_core::CapturePolicy;
+
+    // A well-formed hook that the adapter WOULD normalize into one tool event.
+    let hook = serde_json::json!({
+        "trace": "aabbccddeeff00112233445566778899",
+        "session": "sess-hook-paused",
+        "hook_event_name": "PostToolUse",
+        "tool_name": "Bash",
+        "tool_use_id": "toolu_9",
+        "tool_input": { "command": "deploy" },
+        "tool_response": { "stdout": "ok", "stderr": "" }
+    });
+
+    // ---- master switch OFF: dropped ----
+    {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open_in_dir(dir.path()).unwrap();
+        let policy = CapturePolicy {
+            enabled: false, // master pause (UI toggle / capture-state overlay)
+            ..Default::default()
+        };
+        let config = CollectorConfig::new(dir.path(), ORIGIN)
+            .with_port(0)
+            .with_parent_pid(None)
+            .with_capture_policy(policy);
+        let running = start(config, store.clone()).await.unwrap();
+        let url = format!("http://127.0.0.1:{}/v1/hooks", running.port());
+        let token = running.token().unwrap().to_string();
+
+        let resp = reqwest::Client::new()
+            .post(&url)
+            .bearer_auth(&token)
+            .json(&hook)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 204, "request still accepted when capture paused");
+        assert_eq!(store.count().unwrap(), 0, "master off ⇒ no hook events persisted");
+        running.shutdown().await;
+    }
+
+    // ---- structured tier OFF: dropped ----
+    {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open_in_dir(dir.path()).unwrap();
+        let mut policy = CapturePolicy::default();
+        policy.tiers.structured = false; // structured-tier off (no prompts/tool_*/metadata)
+        let config = CollectorConfig::new(dir.path(), ORIGIN)
+            .with_port(0)
+            .with_parent_pid(None)
+            .with_capture_policy(policy);
+        let running = start(config, store.clone()).await.unwrap();
+        let url = format!("http://127.0.0.1:{}/v1/hooks", running.port());
+        let token = running.token().unwrap().to_string();
+
+        let resp = reqwest::Client::new()
+            .post(&url)
+            .bearer_auth(&token)
+            .json(&hook)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 204, "request still accepted when structured tier off");
+        assert_eq!(store.count().unwrap(), 0, "structured off ⇒ no hook events persisted");
+        running.shutdown().await;
+    }
+
+    // ---- default policy (structured on): persisted ----
+    {
+        let (running, store, _dir) = start_test_collector().await;
+        let url = format!("http://127.0.0.1:{}/v1/hooks", running.port());
+        let token = running.token().unwrap().to_string();
+        let resp = reqwest::Client::new()
+            .post(&url)
+            .bearer_auth(&token)
+            .json(&hook)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 204);
+        assert_eq!(store.count().unwrap(), 1, "default policy persists the hook event");
+        running.shutdown().await;
+    }
+}
+
+#[tokio::test]
+async fn traces_drop_when_capture_paused() {
+    // Regression: `/v1/traces` must honor the capture policy. OTLP spans persist
+    // with name + attributes under the `tool_args` class; a master-pause or
+    // structured-tier-off must stop them (accepted 204, persisted nothing),
+    // mirroring the `/ingest` browser_data gate.
+    use logbook_core::CapturePolicy;
+
+    let otlp = serde_json::json!({
+        "resourceSpans": [{
+            "scopeSpans": [{
+                "spans": [{
+                    "traceId": "112233445566778899aabbccddeeff00",
+                    "spanId": "1122334455667788",
+                    "name": "llm.call",
+                    "startTimeUnixNano": "1700000000000000000",
+                    "status": { "code": 1 },
+                    "attributes": [
+                        { "key": "model", "value": { "stringValue": "claude-3-5-sonnet" } }
+                    ]
+                }]
+            }]
+        }]
+    });
+
+    // ---- master switch OFF: dropped ----
+    {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open_in_dir(dir.path()).unwrap();
+        let policy = CapturePolicy {
+            enabled: false,
+            ..Default::default()
+        };
+        let config = CollectorConfig::new(dir.path(), ORIGIN)
+            .with_port(0)
+            .with_parent_pid(None)
+            .with_capture_policy(policy);
+        let running = start(config, store.clone()).await.unwrap();
+        let url = format!("http://127.0.0.1:{}/v1/traces", running.port());
+        let token = running.token().unwrap().to_string();
+
+        let resp = reqwest::Client::new()
+            .post(&url)
+            .bearer_auth(&token)
+            .json(&otlp)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 204, "request still accepted when capture paused");
+        assert_eq!(store.count().unwrap(), 0, "master off ⇒ no spans persisted");
+        running.shutdown().await;
+    }
+
+    // ---- structured tier OFF: dropped ----
+    {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open_in_dir(dir.path()).unwrap();
+        let mut policy = CapturePolicy::default();
+        policy.tiers.structured = false;
+        let config = CollectorConfig::new(dir.path(), ORIGIN)
+            .with_port(0)
+            .with_parent_pid(None)
+            .with_capture_policy(policy);
+        let running = start(config, store.clone()).await.unwrap();
+        let url = format!("http://127.0.0.1:{}/v1/traces", running.port());
+        let token = running.token().unwrap().to_string();
+
+        let resp = reqwest::Client::new()
+            .post(&url)
+            .bearer_auth(&token)
+            .json(&otlp)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 204, "request still accepted when structured tier off");
+        assert_eq!(store.count().unwrap(), 0, "structured off ⇒ no spans persisted");
+        running.shutdown().await;
+    }
+
+    // ---- default policy (structured on): persisted ----
+    {
+        let (running, store, _dir) = start_test_collector().await;
+        let url = format!("http://127.0.0.1:{}/v1/traces", running.port());
+        let token = running.token().unwrap().to_string();
+        let resp = reqwest::Client::new()
+            .post(&url)
+            .bearer_auth(&token)
+            .json(&otlp)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 204);
+        assert_eq!(store.count().unwrap(), 1, "default policy persists the span");
+        running.shutdown().await;
+    }
+}
+
+#[tokio::test]
+async fn traces_401_without_token_and_maps_otlp_span() {
+    // `/v1/traces` is bearer-gated and maps a minimal OTLP-JSON span to a
+    // Kind::Span event with redacted attributes.
+    let (running, store, _dir) = start_test_collector().await;
+    let url = format!("http://127.0.0.1:{}/v1/traces", running.port());
+    let token = running.token().unwrap().to_string();
+    let client = reqwest::Client::new();
+
+    let otlp = serde_json::json!({
+        "resourceSpans": [{
+            "scopeSpans": [{
+                "spans": [{
+                    "traceId": "112233445566778899aabbccddeeff00",
+                    "spanId": "1122334455667788",
+                    "name": "llm.call",
+                    "startTimeUnixNano": "1700000000000000000",
+                    "status": { "code": 1 },
+                    "attributes": [
+                        { "key": "model", "value": { "stringValue": "claude-3-5-sonnet" } },
+                        { "key": "api_key", "value": { "stringValue": "AKIAIOSFODNN7EXAMPLE" } },
+                        { "key": "tokens", "value": { "intValue": 128 } }
+                    ]
+                }]
+            }]
+        }]
+    });
+
+    // Bad bearer -> 401.
+    let bad = client.post(&url).bearer_auth("nope").json(&otlp).send().await.unwrap();
+    assert_eq!(bad.status(), 401);
+    assert_eq!(store.count().unwrap(), 0);
+
+    // Good bearer -> 204 + one span event.
+    let ok = client.post(&url).bearer_auth(&token).json(&otlp).send().await.unwrap();
+    assert_eq!(ok.status(), 204);
+
+    let events = store
+        .query(&Query::new().trace("112233445566778899aabbccddeeff00").limit(10))
+        .unwrap();
+    assert_eq!(events.len(), 1, "one OTLP span → one event");
+    let ev = &events[0];
+    assert_eq!(ev.kind, logbook_core::Kind::Span);
+    assert_eq!(ev.attributes.get("model").and_then(|v| v.as_str()), Some("claude-3-5-sonnet"));
+    // The secret-looking attribute value is redacted before persistence.
+    let key_attr = ev.attributes.get("api_key").and_then(|v| v.as_str()).unwrap_or("");
+    assert!(!key_attr.contains("AKIAIOSFODNN7EXAMPLE"), "secret leaked in OTLP attr: {key_attr}");
+    assert_eq!(ev.attributes.get("tokens").and_then(|v| v.as_u64()), Some(128));
+
+    running.shutdown().await;
+}
+
+#[tokio::test]
 async fn cleanup_does_not_remove_files_owned_by_another_pid() {
     // Simulate a relaunched collector adopting the out-dir: write a record with
     // a different pid, then call cleanup with our pid — it must NOT delete it.
