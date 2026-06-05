@@ -8,10 +8,13 @@ import type {
   CapturePolicyUpdate,
   CapturePolicyView,
   EventPage,
+  FindingPage,
   Inventory,
   SessionDetail,
   SessionPage,
   SessionSummary,
+  SessionTree,
+  Severity,
 } from "./types";
 
 // The header the capture-toggle POST must echo the per-process CSRF token in.
@@ -92,6 +95,22 @@ export const api = {
   // One session's full replay detail (header + transcript + diffs + events).
   async session(id: string, signal?: AbortSignal): Promise<SessionDetail> {
     return getJson<SessionDetail>(`/api/sessions/${encodeURIComponent(id)}`, signal);
+  },
+
+  // The session's correlation timeline: its events grouped by turn (Phase 3).
+  async sessionTree(id: string, signal?: AbortSignal): Promise<SessionTree> {
+    return getJson<SessionTree>(
+      `/api/sessions/${encodeURIComponent(id)}/tree`,
+      signal,
+    );
+  },
+
+  // Security findings, newest-first (Phase 3 Risk feed). `minSeverity` drops
+  // findings below the given rank (info < low < medium < high < critical).
+  async findings(minSeverity?: Severity, signal?: AbortSignal): Promise<AgentEvent[]> {
+    const qs = minSeverity ? `?severity=${encodeURIComponent(minSeverity)}` : "";
+    const page = await getJson<FindingPage>(`/api/findings${qs}`, signal);
+    return page.findings;
   },
 
   // The effective capture policy + the CSRF token + the conflict version.

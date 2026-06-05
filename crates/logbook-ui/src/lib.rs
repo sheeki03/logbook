@@ -53,6 +53,7 @@ pub use inventory::{
 pub use server::{app, bind, serve, serve_with_state, UiConfig, UiServer, DEFAULT_PORT};
 pub use sessions::{
     list_sessions, load_session, SessionAction, SessionDetail, SessionSummary, SessionTranscript,
+    SessionTreeView, TurnGroupView,
 };
 pub use state::AppState;
 
@@ -393,6 +394,212 @@ mod tests {
         let (status, json) = get_json(&app, "/api/sessions/nope").await;
         assert_eq!(status, StatusCode::NOT_FOUND);
         assert!(json["error"].as_str().unwrap_or_default().contains("nope"));
+    }
+
+    // ───────────────── findings feed (Phase 3 Risk) ─────────────────
+
+    /// Plant three security findings (a detect-style secret-in-diff at High, a
+    /// medium risky-git finding, and an info advisory) so the severity filter
+    /// has something to discriminate. Returns the store.
+    fn seed_findings() -> Store {
+        let store = Store::open_in_memory().unwrap();
+        let trace = TraceId::new();
+
+        let mut info = Event::new(trace, Kind::Finding, Category::Security, "advisory")
+            .with_finding(FindingBlock {
+                source: Some("detect".into()),
+                rule_id: Some("tool_call_rate".into()),
+                severity: Some(Severity::Info),
+                message: Some("informational rate note".into()),
+                ..Default::default()
+            });
+        info.timestamp = logbook_core::MicrosTimestamp(1_000);
+        store.insert(&info).unwrap();
+
+        let mut medium = Event::new(trace, Kind::Finding, Category::Security, "advisory")
+            .with_finding(FindingBlock {
+                source: Some("detect".into()),
+                rule_id: Some("risky_git".into()),
+                severity: Some(Severity::Medium),
+                file: Some("scripts/deploy.sh".into()),
+                message: Some("history rewrite (git rebase)".into()),
+                ..Default::default()
+            });
+        medium.timestamp = logbook_core::MicrosTimestamp(2_000);
+        store.insert(&medium).unwrap();
+
+        let mut high = Event::new(trace, Kind::Finding, Category::Security, "advisory")
+            .with_finding(FindingBlock {
+                source: Some("detect".into()),
+                rule_id: Some("secret_in_diff".into()),
+                severity: Some(Severity::High),
+                file: Some("src/config.rs".into()),
+                line: Some(42),
+                message: Some("a secret was present in a code change".into()),
+            });
+        high.timestamp = logbook_core::MicrosTimestamp(3_000);
+        store.insert(&high).unwrap();
+
+        store
+    }
+
+    #[tokio::test]
+    async fn findings_endpoint_returns_security_findings_newest_first() {
+        let app = app(AppState::new(seed_findings(), EventBus::new()));
+        let (status, json) = get_json(&app, "/api/findings").await;
+        assert_eq!(status, StatusCode::OK);
+        let findings = json["findings"].as_array().unwrap();
+        assert_eq!(findings.len(), 3);
+        // Newest-first: the High secret-in-diff (ts=3000) leads, the Info note last.
+        assert_eq!(findings[0]["finding"]["rule_id"], "secret_in_diff");
+        assert_eq!(findings[0]["finding"]["severity"], "high");
+        assert_eq!(findings[0]["finding"]["line"], 42);
+        assert_eq!(findings[2]["finding"]["severity"], "info");
+    }
+
+    #[tokio::test]
+    async fn findings_endpoint_filters_by_min_severity() {
+        let app = app(AppState::new(seed_findings(), EventBus::new()));
+        // severity=medium drops the Info finding, keeps Medium + High.
+        let (status, json) = get_json(&app, "/api/findings?severity=medium").await;
+        assert_eq!(status, StatusCode::OK);
+        let findings = json["findings"].as_array().unwrap();
+        assert_eq!(findings.len(), 2);
+        assert!(findings
+            .iter()
+            .all(|f| f["finding"]["severity"] != "info"));
+
+        // severity=critical drops everything (nothing is that severe here).
+        let (_s, none) = get_json(&app, "/api/findings?severity=critical").await;
+        assert!(none["findings"].as_array().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn findings_endpoint_rejects_unknown_severity() {
+        let app = app(AppState::new(seed_findings(), EventBus::new()));
+        let (status, json) = get_json(&app, "/api/findings?severity=spicy").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(
+            json["error"].as_str().unwrap_or_default().contains("spicy"),
+            "error body should name the bad severity, got {json}"
+        );
+    }
+
+    #[tokio::test]
+    async fn findings_endpoint_empty_when_no_security_events() {
+        // A store with only an app-log line has no security findings.
+        let store = Store::open_in_memory().unwrap();
+        let mut log = Event::new(TraceId::new(), Kind::Log, Category::AppLog, "stdout")
+            .with_name("nothing risky here");
+        log.timestamp = logbook_core::MicrosTimestamp(10);
+        store.insert(&log).unwrap();
+        let app = app(AppState::new(store, EventBus::new()));
+        let (status, json) = get_json(&app, "/api/findings").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(json["findings"].as_array().unwrap().is_empty());
+    }
+
+    // ───────────────── session tree (Phase 3 correlation) ─────────────────
+
+    /// Plant one session whose events span two turns plus a turn-less finding,
+    /// so the correlation tree groups them: turn 0 (an agent step + a tool
+    /// call), turn 1 (an llm call), and a turn-less security finding.
+    fn seed_tree_session(store: &Store) {
+        let trace = TraceId::new();
+        let trace_hex = trace.to_hex();
+        store
+            .write(move |conn| {
+                conn.execute(
+                    "INSERT INTO agent_sessions \
+                       (id, endpoint_id, agent, command, trace_id, started_at, ended_at, exit_code) \
+                     VALUES ('tree-1', NULL, 'claude', 'claude -- build', ?1, 100, 400, 0)",
+                    [&trace_hex],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+
+        let sess = logbook_core::SessionId::new("tree-1");
+        let turn = |t: u64| logbook_core::AgentBlock {
+            turn: Some(t),
+            ..Default::default()
+        };
+
+        // Turn 0: an agent step.
+        let mut step = Event::new(trace, Kind::Agent, Category::Agent, "turn")
+            .with_name("plan the change")
+            .with_session(sess.clone())
+            .with_agent(turn(0));
+        step.timestamp = logbook_core::MicrosTimestamp(150);
+        store.insert(&step).unwrap();
+
+        // Turn 0: a tool call under the same turn.
+        let mut tool = Event::new(trace, Kind::Tool, Category::Agent, "tools/call")
+            .with_name("edit_file")
+            .with_session(sess.clone())
+            .with_agent(turn(0));
+        tool.timestamp = logbook_core::MicrosTimestamp(160);
+        store.insert(&tool).unwrap();
+
+        // Turn 1: an llm call.
+        let mut llm = Event::new(trace, Kind::Llm, Category::Agent, "chat.completion")
+            .with_name("anthropic claude-3")
+            .with_session(sess.clone())
+            .with_agent(turn(1));
+        llm.timestamp = logbook_core::MicrosTimestamp(200);
+        store.insert(&llm).unwrap();
+
+        // A turn-less security finding correlated by session (no stamped turn).
+        let mut finding = Event::new(trace, Kind::Finding, Category::Security, "advisory")
+            .with_finding(FindingBlock {
+                source: Some("detect".into()),
+                rule_id: Some("secret_in_diff".into()),
+                severity: Some(Severity::High),
+                message: Some("a secret was present in a code change".into()),
+                ..Default::default()
+            })
+            .with_session(sess);
+        finding.timestamp = logbook_core::MicrosTimestamp(300);
+        store.insert(&finding).unwrap();
+    }
+
+    #[tokio::test]
+    async fn session_tree_endpoint_groups_events_by_turn() {
+        let store = Store::open_in_memory().unwrap();
+        seed_tree_session(&store);
+        let app = app(AppState::new(store, EventBus::new()));
+        let (status, json) = get_json(&app, "/api/sessions/tree-1/tree").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["session_id"], "tree-1");
+        assert_eq!(json["event_count"], 4);
+
+        let turns = json["turns"].as_array().unwrap();
+        // Three groups: turn 0, turn 1, and the turn-less (null) catch-all last.
+        assert_eq!(turns.len(), 3);
+        assert_eq!(turns[0]["turn"], 0);
+        assert_eq!(turns[0]["events"].as_array().unwrap().len(), 2);
+        // Turn 0 children are oldest-first: the agent step then the tool call.
+        assert_eq!(turns[0]["events"][0]["kind"], "agent");
+        assert_eq!(turns[0]["events"][1]["kind"], "tool");
+        assert_eq!(turns[1]["turn"], 1);
+        assert_eq!(turns[1]["events"][0]["kind"], "llm");
+        // The turn-less group sorts last and carries the security finding.
+        assert!(turns[2]["turn"].is_null());
+        assert_eq!(turns[2]["events"][0]["category"], "security");
+        assert_eq!(turns[2]["events"][0]["finding"]["rule_id"], "secret_in_diff");
+    }
+
+    #[tokio::test]
+    async fn session_tree_endpoint_unknown_session_is_empty_ok() {
+        // An unknown session is a 200 with an empty tree (nothing to correlate),
+        // not a 404 — the correlation view of "no events" is "no turns".
+        let store = Store::open_in_memory().unwrap();
+        let app = app(AppState::new(store, EventBus::new()));
+        let (status, json) = get_json(&app, "/api/sessions/ghost/tree").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["session_id"], "ghost");
+        assert_eq!(json["event_count"], 0);
+        assert!(json["turns"].as_array().unwrap().is_empty());
     }
 
     // ───────────────── capture-policy endpoint (Orbit §1.4) ─────────────────

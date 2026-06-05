@@ -2,8 +2,8 @@
 //!
 //! The UI server is a *separate* axum app from the collector. It exposes:
 //! - the embedded static bundle (`GET /*path`, SPA fallback) — [`crate::embed`];
-//! - read-only JSON APIs `/api/events`, `/api/timeline`, `/api/inventory` —
-//!   [`crate::api`];
+//! - read-only JSON APIs `/api/events`, `/api/timeline`, `/api/inventory`,
+//!   `/api/findings`, `/api/sessions[/:id[/tree]]` — [`crate::api`];
 //! - a live-tail SSE endpoint `/api/stream` — [`crate::sse`].
 //!
 //! Binding follows the OpenLogs collector contract: `127.0.0.1` only, with port
@@ -84,8 +84,10 @@ pub fn app(state: AppState) -> Router {
         .route("/api/events", get(api::events))
         .route("/api/timeline", get(api::timeline))
         .route("/api/inventory", get(api::inventory))
+        .route("/api/findings", get(api::findings))
         .route("/api/sessions", get(api::sessions))
         .route("/api/sessions/{id}", get(api::session))
+        .route("/api/sessions/{id}/tree", get(api::session_tree))
         .route(
             "/api/capture-policy",
             get(capture::get_capture_policy).post(capture::set_capture_policy),

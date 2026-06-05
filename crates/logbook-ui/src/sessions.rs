@@ -28,7 +28,7 @@ use serde::Serialize;
 
 use logbook_core::Event;
 use logbook_store::error::Result as StoreResult;
-use logbook_store::Store;
+use logbook_store::{SessionTree, Store, TurnGroup};
 
 /// One row in the Sessions master list: the `agent_sessions` header plus two
 /// derived columns — the count of recorded `agent_actions` and whether a
@@ -104,6 +104,61 @@ pub struct SessionDetail {
     /// per-line transcript events, commands, tool/LLM events, etc. Empty when
     /// the session has no `trace_id` (so there is nothing to correlate).
     pub events: Vec<Event>,
+}
+
+/// One turn of a [`SessionTreeView`]: the wire projection of the store's
+/// [`TurnGroup`]. `turn` is the zero-based agent-turn index, or `null` for the
+/// catch-all group of turn-less events (tool / log / finding rows linked to
+/// their turn by time rather than a stamped index); the `null` group sorts last.
+///
+/// This is a thin serializable mirror of the (non-`Serialize`) store type — the
+/// same read-model pattern this crate already uses for inventory/session rows —
+/// so `logbook-store` stays unchanged and untouched by the UI layer.
+#[derive(Clone, Debug, Serialize, PartialEq)]
+pub struct TurnGroupView {
+    /// The turn index this group represents, or `None` (serialized `null`) for
+    /// the turn-less catch-all group, which always sorts last.
+    pub turn: Option<i64>,
+    /// The events in this turn, oldest-first (ascending timestamp, then rowid).
+    pub events: Vec<Event>,
+}
+
+impl From<TurnGroup> for TurnGroupView {
+    fn from(g: TurnGroup) -> Self {
+        Self {
+            turn: g.turn,
+            events: g.events,
+        }
+    }
+}
+
+/// The correlation timeline for one session (`GET /api/sessions/:id/tree`): the
+/// session's events grouped by turn, turns ascending with the turn-less group
+/// last (children oldest-first within each turn). The wire projection of the
+/// store's [`SessionTree`].
+///
+/// `event_count` is included as a derived convenience so the UI can render a
+/// badge without summing the groups itself (it mirrors
+/// [`SessionTree::event_count`]).
+#[derive(Clone, Debug, Serialize, PartialEq)]
+pub struct SessionTreeView {
+    /// The session id this tree was built for.
+    pub session_id: String,
+    /// The turn groups, ascending by turn index with the turn-less group last.
+    pub turns: Vec<TurnGroupView>,
+    /// Total number of events across all turns (a UI-badge convenience).
+    pub event_count: usize,
+}
+
+impl From<SessionTree> for SessionTreeView {
+    fn from(tree: SessionTree) -> Self {
+        let event_count = tree.event_count();
+        Self {
+            session_id: tree.session_id,
+            turns: tree.turns.into_iter().map(TurnGroupView::from).collect(),
+            event_count,
+        }
+    }
 }
 
 /// List all recorded sessions, newest-first, with their action count and a

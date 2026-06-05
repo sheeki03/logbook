@@ -6,9 +6,10 @@ import type {
   SessionAction,
   SessionDetail,
   SessionSummary,
+  SessionTree,
 } from "../types";
 import { eventSummary, formatTime } from "../format";
-import { CategoryBadge, StatusBadge } from "../components/Badge";
+import { CategoryBadge, SeverityBadge, StatusBadge } from "../components/Badge";
 import { CapturePanel } from "./CapturePanel";
 
 // Session replay (Orbit plan §1.4): a master list of recorded `logbook agent`
@@ -248,6 +249,11 @@ function ReplayBody({ detail }: { detail: SessionDetail }) {
         )}
       </Section>
 
+      {/* Correlation / turn tree (Phase 3): agent action -> diff -> command ->
+          runtime log -> finding, woven by turn. Fetched separately from the
+          flat detail so the grouping stays a single store-side read. */}
+      <CorrelationTree sessionId={session.session_id} />
+
       {/* Per-session timeline — the event-row reused, scoped to this trace */}
       <Section title={`Timeline (${events.length})`}>
         {events.length === 0 ? (
@@ -270,6 +276,79 @@ function ReplayBody({ detail }: { detail: SessionDetail }) {
         )}
       </Section>
     </div>
+  );
+}
+
+// The correlation tree (Phase 3): the session's events grouped by turn, fetched
+// from GET /api/sessions/:id/tree. Turns are the parents; the tool / llm / log /
+// finding events within each turn are the children, in timeline order — the
+// "agent action -> diff -> command -> runtime log -> finding" trace.
+function CorrelationTree({ sessionId }: { sessionId: string }) {
+  const [tree, setTree] = useState<SessionTree | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    const ctrl = new AbortController();
+    setTree(null);
+    setError(null);
+    api
+      .sessionTree(sessionId, ctrl.signal)
+      .then(setTree)
+      .catch((e: unknown) => {
+        if (!ctrl.signal.aborted) setError(String(e));
+      });
+    return () => ctrl.abort();
+  }, [sessionId]);
+
+  return (
+    <Section title={`Correlation${tree ? ` (${tree.event_count})` : ""}`}>
+      {error && <div className="error-bar">{error}</div>}
+      {!tree && !error && <div className="empty small">Loading correlation…</div>}
+      {tree && tree.turns.length === 0 && (
+        <div className="empty small">
+          No correlated events to weave. Turn/tool structure arrives with
+          structured capture (Phase 2 hooks / MCP proxy).
+        </div>
+      )}
+      {tree && tree.turns.length > 0 && (
+        <ol className="turn-tree">
+          {tree.turns.map((g, gi) => (
+            <li key={g.turn ?? `none-${gi}`} className="turn-node">
+              <div className="turn-label">
+                <span className="turn-badge">
+                  {g.turn != null ? `turn ${g.turn}` : "unturned"}
+                </span>
+                <span className="turn-count">
+                  {g.events.length} event{g.events.length === 1 ? "" : "s"}
+                </span>
+              </div>
+              <ul className="turn-children">
+                {g.events.map((ev) => (
+                  <TraceNode key={ev.id} ev={ev} />
+                ))}
+              </ul>
+            </li>
+          ))}
+        </ol>
+      )}
+    </Section>
+  );
+}
+
+// One child row in the correlation tree: a category-railed event with its kind,
+// a one-line summary, and (for findings) a severity badge — so the
+// action/diff/command/log/finding chain reads top-to-bottom within a turn.
+function TraceNode({ ev }: { ev: AgentEvent }) {
+  return (
+    <li
+      className={`trace-node cat-${ev.category} ${ev.status === "error" ? "is-error" : ""}`}
+    >
+      <span className="ts">{formatTime(ev.timestamp)}</span>
+      <span className="kind-tag">{ev.kind}</span>
+      <span className="summary">{eventSummary(ev)}</span>
+      {ev.finding?.severity && <SeverityBadge severity={ev.finding.severity} />}
+      <StatusBadge status={ev.status} />
+    </li>
   );
 }
 

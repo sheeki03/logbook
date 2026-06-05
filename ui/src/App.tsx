@@ -3,12 +3,14 @@ import { useState } from "react";
 import { Timeline } from "./views/Timeline";
 import { Inventory } from "./views/Inventory";
 import { Sessions } from "./views/Sessions";
+import { Risk } from "./views/Risk";
 
-type View = "timeline" | "sessions" | "inventory";
+type View = "timeline" | "sessions" | "risk" | "inventory";
 
 const NAV: { id: View; label: string }[] = [
   { id: "timeline", label: "Timeline" },
   { id: "sessions", label: "Sessions" },
+  { id: "risk", label: "Risk" },
   { id: "inventory", label: "Inventory" },
 ];
 
@@ -38,6 +40,7 @@ export default function App() {
       <main className="app-main">
         {view === "timeline" && <Timeline />}
         {view === "sessions" && <Sessions />}
+        {view === "risk" && <Risk />}
         {view === "inventory" && <Inventory />}
       </main>
     </div>

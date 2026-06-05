@@ -35,18 +35,24 @@ export interface LlmBlock {
   total_tokens?: number;
   temperature?: number;
   cost_usd?: number;
+  finish_reason?: string;
+  stream?: boolean;
 }
 
 export interface ToolBlock {
   tool_name?: string;
   is_write?: boolean;
   arguments?: unknown;
+  result_summary?: string;
 }
 
 export interface AgentBlock {
   agent?: string;
   step?: number;
   role?: string;
+  // Zero-based turn index (coarser than step); drives the correlation tree.
+  turn?: number;
+  tool_call_id?: string;
 }
 
 export interface ConsoleBlock {
@@ -210,6 +216,33 @@ export interface SessionDetail {
 
 export interface SessionPage {
   sessions: SessionSummary[];
+}
+
+// ---- Risk / findings DTOs (Phase 3) ----
+
+// GET /api/findings: security findings (Kind::Finding + Category::Security
+// events carrying a FindingBlock), newest-first, optionally severity-filtered.
+export interface FindingPage {
+  findings: AgentEvent[];
+}
+
+// ---- Correlation timeline DTOs (Phase 3) ----
+
+// One turn of a SessionTree: the turn index (or null for the catch-all group
+// of turn-less tool/log/finding events, which sorts last) and its child events
+// oldest-first.
+export interface TurnGroup {
+  turn: number | null;
+  events: AgentEvent[];
+}
+
+// GET /api/sessions/:id/tree: the session's events grouped by turn (turns
+// ascending, the turn-less group last) — the agent action -> diff -> command
+// -> runtime log -> finding correlation view.
+export interface SessionTree {
+  session_id: string;
+  turns: TurnGroup[];
+  event_count: number;
 }
 
 // ---- Capture policy DTOs (Orbit plan §1.4) ----

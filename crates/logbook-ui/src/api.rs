@@ -1,9 +1,13 @@
-//! JSON API handlers (plan §1): `/api/events`, `/api/timeline`, `/api/inventory`.
+//! JSON API handlers (plan §1, §Phase 3): `/api/events`, `/api/timeline`,
+//! `/api/inventory`, `/api/findings`, `/api/sessions[/:id[/tree]]`.
 //!
-//! All three are read-only queries over [`logbook_store`]. Events are returned
-//! in an `{ "events": [...] }` envelope (matching the front-end `EventPage`
-//! type); `/api/events` is newest-first (a feed), `/api/timeline` is oldest-first
+//! All are read-only queries over [`logbook_store`]. Events are returned in an
+//! `{ "events": [...] }` envelope (matching the front-end `EventPage` type);
+//! `/api/events` is newest-first (a feed), `/api/timeline` is oldest-first
 //! (reading order). The inventory endpoint returns the full five-tab snapshot.
+//! `/api/findings` is the Phase-3 Risk feed (security findings, newest-first,
+//! optionally filtered to a minimum severity); `/api/sessions/:id/tree` is the
+//! Phase-3 correlation timeline (a session's events grouped by turn).
 
 use axum::extract::{Query, State};
 use axum::http::StatusCode;
@@ -11,11 +15,11 @@ use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde::{Deserialize, Serialize};
 
-use logbook_core::{Category, Event};
+use logbook_core::{Category, Event, Severity};
 use logbook_store::Query as StoreQuery;
 
 use crate::inventory::{self, InventorySnapshot};
-use crate::sessions::{self, SessionDetail, SessionSummary};
+use crate::sessions::{self, SessionDetail, SessionSummary, SessionTreeView};
 use crate::state::AppState;
 
 /// Default row cap for event queries when the client does not specify one.
@@ -115,6 +119,71 @@ pub async fn inventory(
     Ok(Json(snapshot))
 }
 
+/// Query-string filters accepted by `/api/findings`.
+#[derive(Debug, Default, Deserialize)]
+pub struct FindingParams {
+    /// Minimum severity (`info`..`critical`). Findings *below* this rank are
+    /// dropped. An unrecognized token is a 400 (mirrors the strictness of the
+    /// MCP `list_findings` tool, which also parses via [`Severity::from_wire`]).
+    pub severity: Option<String>,
+    /// Row cap (clamped to [`MAX_LIMIT`]).
+    pub limit: Option<u32>,
+}
+
+/// The `{ "findings": [...] }` response envelope for the Risk feed.
+#[derive(Debug, Serialize)]
+pub struct FindingPage {
+    /// The matched finding events, newest-first.
+    pub findings: Vec<Event>,
+}
+
+/// `GET /api/findings` — security findings (Phase 3 Risk feed), newest-first,
+/// optionally filtered to a minimum severity.
+///
+/// Findings are the [`Category::Security`] events the detect engine emits
+/// (`Kind::Finding` carrying a [`FindingBlock`](logbook_core::FindingBlock)).
+/// They are read through the same [`StoreQuery`] path as `/api/events` (so the
+/// indexes are reused), then post-filtered by severity in Rust: severity lives
+/// in the JSON `FindingBlock`, not a column, and ranking here via the core
+/// [`Severity`] `Ord` keeps the SQL simple and the ordering stable (newest
+/// first). Everything read is already redacted at write time, so it is safe to
+/// ship to the browser.
+pub async fn findings(
+    State(state): State<AppState>,
+    Query(params): Query<FindingParams>,
+) -> Result<Json<FindingPage>, ApiError> {
+    // Parse the floor once, via the canonical core enum; an unknown token is a
+    // client error rather than a silently-ignored filter.
+    let min_severity: Option<Severity> = match params.severity.as_deref() {
+        Some(s) => Some(
+            Severity::from_wire(s)
+                .ok_or_else(|| ApiError::bad_request(format!("unknown severity: {s}")))?,
+        ),
+        None => None,
+    };
+    let limit = params.limit.unwrap_or(DEFAULT_LIMIT).min(MAX_LIMIT);
+    let query = StoreQuery::new().category(Category::Security).limit(limit);
+    let events = state.store.query(&query)?;
+
+    // Min-severity post-filter, comparing against the core ordering (Info < Low
+    // < … < Critical). A finding with no severity is conservatively dropped when
+    // a floor is set (it cannot be shown to clear the bar).
+    let findings = match min_severity {
+        None => events,
+        Some(min) => events
+            .into_iter()
+            .filter(|e| {
+                e.blocks
+                    .finding
+                    .as_ref()
+                    .and_then(|f| f.severity)
+                    .is_some_and(|sev| sev >= min)
+            })
+            .collect(),
+    };
+    Ok(Json(FindingPage { findings }))
+}
+
 /// The `{ "sessions": [...] }` response envelope for the master list.
 #[derive(Debug, Serialize)]
 pub struct SessionPage {
@@ -140,6 +209,24 @@ pub async fn session(
         Some(detail) => Ok(Json(detail)),
         None => Err(ApiError::not_found(format!("no session: {id}"))),
     }
+}
+
+/// `GET /api/sessions/:id/tree` — the Phase-3 **correlation timeline** for one
+/// session: its events grouped by turn (turns ascending, the turn-less catch-all
+/// group last; children oldest-first within each turn). This is the "agent
+/// action → diff → command → runtime log → finding" view woven by the shared
+/// `session_id`.
+///
+/// Built via [`Store::session_tree`](logbook_store::Store::session_tree). An
+/// unknown session id is **not** a 404 here: `session_tree` returns an empty
+/// tree for a session with no events, which is the correct correlation view
+/// (nothing to correlate), so the endpoint returns `200` with empty `turns`.
+pub async fn session_tree(
+    State(state): State<AppState>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Result<Json<SessionTreeView>, ApiError> {
+    let tree = state.store.session_tree(&id)?;
+    Ok(Json(SessionTreeView::from(tree)))
 }
 
 /// API error wrapper.
