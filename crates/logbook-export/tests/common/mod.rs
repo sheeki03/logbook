@@ -55,6 +55,7 @@ pub fn llm_call() -> Event {
                 total_tokens: Some(1545),
                 temperature: Some(0.2),
                 cost_usd: Some(0.0123),
+                ..Default::default()
             }),
         "1111111111111111aaaaaaaaaaaaaaaa",
         BASE_MICROS,
@@ -77,6 +78,7 @@ pub fn tool_call() -> Event {
                 tool_name: Some("read_file".into()),
                 is_write: Some(false),
                 arguments: Some(serde_json::json!({"path": "src/main.rs"})),
+                ..Default::default()
             }),
         "2222222222222222bbbbbbbbbbbbbbbb",
         BASE_MICROS + 1_000_000,
@@ -157,6 +159,7 @@ pub fn agent_action() -> Event {
                 agent: Some("claude".into()),
                 step: Some(1),
                 role: Some("assistant".into()),
+                ..Default::default()
             }),
         "6666666666666666ffffffffffffffff",
         BASE_MICROS + 5_000_000,
