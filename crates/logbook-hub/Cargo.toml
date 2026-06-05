@@ -5,6 +5,31 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
-description = "v1.5 hub: receiver + retention + audit + RBAC + fleet inventory roll-up. Stub."
+description = "v1.5 hub: fleet receiver + governance plane — bearer-gated /hub/ingest, hash-chain audit, RBAC export projection, retention, multi-endpoint inventory roll-up."
 
 [dependencies]
+logbook-core = { workspace = true }
+logbook-store = { workspace = true }
+# The export/sanitization projection (project_event_for_export) is reused for the
+# RBAC Viewer read, so the hub depends on logbook-inventory directly (path, like
+# the collector depends on logbook-harness by path — promote to a workspace dep
+# when a second crate needs it).
+logbook-inventory = { path = "../logbook-inventory" }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+# Direct handle to the writer connection (the `Store::write_returning` closure
+# yields a `rusqlite::Connection`); pinned to match the store's 0.38 / shared
+# libsqlite3-sys, like logbook-inventory does.
+rusqlite = "0.38"
+# Match the collector's server stack (axum 0.8, scoped CORS, loopback bind).
+axum = "0.8.9"
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "time", "net", "signal"] }
+tower-http = { version = "0.6.11", features = ["cors"] }
+
+[dev-dependencies]
+tempfile = "3.27.0"
+reqwest = { version = "0.12", default-features = false, features = ["json"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "time", "net", "signal", "test-util"] }
