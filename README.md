@@ -1,281 +1,201 @@
 # logbook
 
-> A **local-first observability plane for agent-built software** — runtime evidence, browser state, agent actions, MCP/agent inventory, and security findings, correlated on one timeline.
+> **A local-first black-box flight recorder for AI coding agents.**
+> It records what your agent actually did — every prompt, tool call, command, and file change — onto one redacted, replayable, local timeline. So you can review it, catch risky actions before they land, undo a bad run, and debug from real evidence.
 
-`logbook` is **agent-agnostic** (works with any MCP-capable coding agent — Claude Code, Cursor, Codex, …), built in **Rust** (single binary) + an embedded **React/TS** UI, and reuses your own tools (`schrute`, `security-suite`) over clean boundaries.
+When an AI coding agent works on your machine, you mostly see the *result*: some files changed, a summary in the chat. What it read, the commands it ran, the secrets it touched, the prompts and responses behind it all — gone the moment the session ends. `logbook` is the recorder for that session.
 
-**Status:** v1, `0.1.0` · POSIX only (macOS/Linux) · Apache-2.0 · `cargo build` clean, **362 tests passing / 0 failing**.
+Point it at any agent — **Claude Code, Codex, Aider, or any CLI / SDK** — and it captures the session as structured, secret-redacted events in a local SQLite timeline you fully own. Nothing leaves your machine unless you explicitly export it.
 
----
-
-## Why
-
-AI coding agents debug by *guessing*: read the code, form a theory, edit, hope. `logbook` gives the agent **real runtime evidence** instead, gives **you** visibility into **what the agent actually did**, and surfaces **which agents and MCP servers exist on this machine at all** — all on a single timeline.
-
-logbook starts at the **developer workstation** and captures the evidence layer around coding agents — what they saw, what they changed, which MCP servers / tools they used, and what runtime and security signals resulted. v1 ships **local** endpoint inventory + agent/MCP discovery (the foundation for AI-usage visibility) — not fleet governance.
-
-## What it captures
-
-| Lane | How |
-|------|-----|
-| **Runtime logs** | Wraps your command in a PTY; mirrors output to a raw transcript, a cleaned text log, and structured events |
-| **Browser state** | Injected-JS console/network collector for your own app + `schrute` (record→replay, stealth) over MCP |
-| **Agent actions** | `logbook agent <cli>` wraps an agent's session and records it + the file diffs it produced |
-| **MCP / agent inventory** | Discovers installed agent CLIs, configured MCP servers, running agent processes, and risk/shadow items |
-| **Security findings** | Runs Semgrep / Trivy / cargo-audit on demand, or imports any SARIF/JSON, onto the same timeline |
-
-## Safe by default
-
-- **Read-only by default.** MCP write tools are hidden until per-session opt-in + allowlist + interactive confirm.
-- **Redaction on by default.** Secrets are scrubbed *at capture, before anything is persisted* (`AKIA…` → `«REDACTED:CLOUD_KEY:20»`).
-- **No external egress by default.** Browser navigation/replay needs a non-empty `allowed_domains`.
-- **Local-only binds.** `/ingest` requires a per-run bearer token; the token lives in `collector.token` (`0600`), never in `collector.json`.
-- **No always-on surveillance.** Inventory `scan`/`report` are user-triggered; continuous `watch` is opt-in.
-
----
-
-## Use cases
-
-- **Agent-assisted debugging** — your coding agent reads *real* logs (`tail_log`, `search_logs`, `query_timeline`, `get_errors`) and fixes from runtime evidence instead of guessing; no copy-pasting logs into chat.
-- **Local full-stack dev observability** — one timeline for server stdout/stderr **and** browser console/network while you build.
-- **"What did the agent do?" review** — wrap `claude` / `cursor` / `codex` with `logbook agent <cli>` to record the session and the exact file diffs it produced, before you merge.
-- **Shadow-AI & MCP hygiene** — `logbook inventory report` shows which agent CLIs and MCP servers are configured on a machine, flags unsanctioned/untracked ones, and confirms no secrets sit unredacted in MCP configs.
-- **Security-in-the-loop** — run Semgrep / Trivy / cargo-audit (or import CI SARIF) and see findings correlated with the code and runtime events on the same timeline.
-- **Flaky-bug repro capture** — capture a run's full transcript + structured events to share or triage later.
-- **Feed existing observability** — export the timeline to OpenTelemetry / OpenInference / Langfuse / MLflow.
-- **Dev-machine forensics / onboarding** — quickly map a workstation's AI-tooling footprint.
-
-## What you can do with it
-
-Capture any command's output (PTY) into clean + raw + structured tiers · tail / search / follow past runs · expose a **read-only MCP** tool surface to any agent · pull **passive debug evidence** (non-invasive — never edits your source) · capture browser console/network (injected JS) and drive/replay flows (schrute) · record **agent sessions + diffs** · **inventory** agents / MCP servers / processes and surface shadow & risk · run or import **security scans** · **export** to OTel / OpenInference / Langfuse / MLflow · **auto-redact** secrets · browse it all in a local **web UI**.
-
-## Install
-
-Requires a Rust toolchain (1.80+). Node 18+ is only needed if you want to rebuild the web UI; the scanners (`semgrep`, `trivy`, `cargo-audit`) are optional and soft-degrade if absent.
-
-```sh
-# from the repo root
-cargo install --path crates/logbook-cli      # installs `logbook` to ~/.cargo/bin
-# …or just build and use the binary directly:
-cargo build --release                         # → target/release/logbook
 ```
+$ logbook agent -- claude
+… your normal Claude Code session …
+agent session recorded: claude (7 file action(s), exit 0)
+
+$ logbook detect <session>
+[high] secret_in_diff: redacted secret (CLOUD_KEY) present in code change (config.ts)
+[high] dangerous_shell: dangerous shell command: recursive force-remove (rm -rf)
+
+$ logbook revert <session>      # undo exactly what the agent changed
+$ logbook ui                    # replay the whole thing in a local web UI
+```
+
+- **Local-first & private** — one SQLite file, loopback-only servers, no telemetry. Secrets are scrubbed *at capture, before anything is written to disk*.
+- **Agent-agnostic** — wrap any CLI; ingest Claude Code hooks; parse Codex's structured stream; or proxy raw provider traffic.
+- **Single static binary** — Rust core + an embedded web UI. Apache-2.0.
+
+---
+
+## What it records — three fidelity tiers
+
+| Tier | What it captures | How |
+|------|------------------|-----|
+| **Universal** | Redacted terminal transcript, commands + exit codes, **session-accurate file diffs** | Wrap any command/agent in a capturing PTY |
+| **Structured** | Prompts, tool calls with arguments & results, model / token / cost, turn-and-step tree | Claude Code hooks, an MCP proxy, Codex `--json`, or OTLP ingest |
+| **Complete** | Full provider request/response traffic | An opt-in local LLM API proxy |
+
+Higher tiers are additive — turn on as much fidelity as you want. Everything lands on **one correlated timeline**, keyed by trace and session, so the prompts, the tool calls, and the diffs from a single run read as one coherent story.
 
 ## Quick start
 
+Requires a Rust toolchain (1.80+). The web UI ships prebuilt; the optional security scanners (`semgrep`, `trivy`, `cargo-audit`) soft-degrade if absent.
+
 ```sh
-logbook run -- npm run dev        # capture your dev server (logs → .logbook/)
-logbook tail -- -f                # follow the latest run (forwards args to `tail`)
-logbook inventory report          # what agents / MCP servers / risks are on this machine
-logbook ui                        # open the timeline → http://127.0.0.1:7878
-logbook mcp                       # expose read-only tools to your coding agent over stdio
+cargo install --path crates/logbook-cli     # installs `logbook` to ~/.cargo/bin
+# …or build the binary directly:
+cargo build --release                        # → target/release/logbook
 ```
 
-Everything lands under `./.logbook/` in the current project (override with `--out-dir`).
+```sh
+logbook agent -- claude            # record a Claude Code session + its file diffs
+logbook detect <session>           # scan it for secrets, dangerous commands, risky git, egress…
+logbook ui                         # replay everything in a local web UI (http://127.0.0.1:7878)
+logbook revert <session>           # undo exactly what the agent changed (clean-tree sessions)
+```
 
----
+Everything lands under `./.logbook/` in the current project (override with `--out-dir`). Capture is **on by default within a session you explicitly start** — never passive background harvesting.
+
+## Capture your agent
+
+You choose how deep to record, per agent. These compose.
+
+### Claude Code
+
+```sh
+# Tier 1 — transcript + file diffs (no setup):
+logbook agent -- claude
+
+# Tier 3 — full prompts/responses + token usage. Start the proxy, point Claude at it:
+logbook proxy llm --provider anthropic --yes --no-token
+export ANTHROPIC_BASE_URL=http://127.0.0.1:<port>      # the proxy prints this
+logbook agent -- claude
+
+# Tier 2 — structured tool calls via Claude Code hooks:
+logbook hooks                                          # prints a copy-paste settings.json recipe
+claude --settings <that-file>
+```
+
+Run all three at once and they correlate into a single session.
+
+### Codex
+
+Codex emits a rich structured event stream, so logbook captures it natively — token usage, tool calls, file changes, and reasoning — with no hook wiring:
+
+```sh
+logbook codex -- "refactor the auth module and add tests"
+# → codex session …: 4 llm turns, 9 tool calls, 3 file changes, 41k tokens
+```
+
+(`logbook agent -- codex exec …` also works for the transcript + diffs tier.)
+
+### Anything else
+
+Any CLI gets the Universal tier: `logbook agent -- <cli>`. Any agent or SDK that talks to a provider directly and honors a base-URL override (`ANTHROPIC_BASE_URL` / `OPENAI_BASE_URL`) can be recorded by the LLM proxy. Any MCP-using agent can route its tools through `logbook proxy mcp -- <server>`. Tools that proxy LLM traffic through their own cloud backend can't be intercepted locally — for those, use the wrap or MCP tiers.
+
+## What you can do with the recording
+
+- **Review a run** — replay the transcript, browse the per-file diffs, the tool calls, and the prompts/responses in the web UI or over a read-only MCP surface (so the *agent itself* can query past sessions).
+- **Catch risk** — `logbook detect` runs rules over a session: secret-in-diff, dangerous shell (`rm -rf`, fork bombs), risky git (force-push), non-allowlisted network egress, token/cost spikes, tool-call-rate bursts. `logbook guard -- <agent>` runs the agent and **fails (non-zero exit) if a finding crosses a severity threshold** — a CI gate for agent behavior.
+- **Undo** — `logbook revert <session>` reverses exactly the files a clean-tree session changed, guarded by a recorded post-state hash so it refuses if you've since edited the file.
+- **Share safely** — `logbook session export <id>` writes a self-contained, per-class **sanitized** bundle (metadata only by default; payload classes dropped) for a bug report or PR.
+- **Forget** — `logbook forget <session | --before 7d>` irreversibly deletes a session from the store *and* disk; retention caps prune automatically.
+- **Account for cost** — per-session, per-model token and cost roll-ups.
+- **Export** — emit the timeline to OpenTelemetry / OpenInference / Langfuse / MLflow.
+- **Roll up a fleet** — `logbook hub serve` receives redacted records from many machines, with role-based visibility, server-side retention, and a tamper-evident hash-chain audit log.
+
+## Privacy & safety
+
+logbook is built so the recording can never become a liability.
+
+- **Redaction before persistence — always.** A mandatory **secrets floor** (cloud keys, JWTs, bearer tokens, PEM blocks, `user:pass@` URLs, …) scrubs every record *before it is written*, independent of any setting — `--no-redact` only relaxes general/non-secret redaction, never the floor. Placeholders preserve a length class but not the value: `AKIA… → «REDACTED:CLOUD_KEY:20»`.
+- **No raw file preimages.** Session diffs are computed from an in-memory, **redacted** content baseline; only the redacted diff is stored. The proxy reassembles streamed responses and redacts them before recording — it never persists a raw provider payload.
+- **Local-only by default.** One SQLite file under `.logbook/`. Every server binds loopback; ingest endpoints are bearer-gated (token in `collector.token`, `0600`). No outbound network unless you export.
+- **Fail-closed capture policy.** A `[capture]` section governs per-tier and per-sensitivity-class capture; a malformed policy degrades to capture-**off**, never silently to recording everything.
+- **One switch to pause.** A capture toggle (UI button or `.logbook/capture-state.json`) pauses recording across every logbook process for the session.
+- **Tamper-evidence at the fleet.** The hub keeps a SHA-256 hash-chain over already-redacted stored records, so a later edit to any row is detectable.
 
 ## Commands
 
 All subcommands accept `--out-dir <path>` (default `.logbook`).
 
-### `logbook run [OPTIONS] -- <command>…`
-Run a command inside a capturing PTY (the OpenLogs `run` port). Forwards stdin, handles resize and Ctrl-C, preserves the child's exit code, and reaps the whole descendant process tree on exit.
-
-| Flag | Meaning |
-|------|---------|
-| `--name <name>` | Explicit run name (else the slugified command) |
-| `--no-history` | Skip timestamped history files (keep `latest`/named) |
-| `--print-paths` | Print resolved log paths to stderr at startup |
-| `--terminal-only` / `--text-only` | Keep only the transcript / only the cleaned text tier |
-| `--no-redact` | Disable redaction (**dangerous** — prints a warning) |
-| `--no-collector` | Don't start the browser collector (for non-web commands) |
-
-```sh
-logbook run --print-paths -- bun run dev
-logbook run --name api -- cargo run -p api
-```
-
-### `logbook tail [OPTIONS] [QUERY] [-- <tail args>…]`
-Replay a captured log. No query → latest run; a query → most-recent fuzzy match on name/command/timestamp.
-
-```sh
-logbook tail -- -n 200          # last 200 lines of the latest run
-logbook tail api -- -f          # follow the most recent run matching "api"
-logbook tail --terminal -- -n 50  # the raw transcript instead of cleaned text
-```
-
-### `logbook mcp [--root <dir>]`
-Serve the MCP tool surface over stdio. **Read-only by default**; write tools appear only when enabled in `logbook.toml`. See [MCP integration](#mcp-integration).
-
-### `logbook ui [--port 7878]`
-Serve the embedded web UI (timeline + inventory tabs) on loopback; auto-increments the port on conflict.
-
-### `logbook agent -- <agent-cli>…`
-Wrap an agent's own session (e.g. `logbook agent -- claude`), recording an `agent_session` plus the git/file diffs it produced.
-
-### `logbook inventory <scan|watch|report> [--project <dir>]`
-Endpoint Inventory Lite. `scan` = one-shot discovery; `report` = human/JSON view; `watch` = continuous (opt-in via `enabled_writes`). See [Endpoint inventory](#endpoint-inventory).
-
-### `logbook debug <fetch|sessions>`
-Non-invasive debug. `fetch` opens a passive session, pulls correlated evidence, prints JSON, and ends it. `sessions` lists recorded sessions. DAP logpoints are **alpha** and not exposed as a one-shot CLI flow.
-
-### `logbook security <import <file>|scan> [--root <dir>]`
-`import` ingests a SARIF/JSON document as security findings (ungated). `scan` runs the configured scanners over a target (gated by `allow_security_scans`; soft-degrades when a scanner binary is missing).
-
-### `logbook export [OPTIONS]`
-Export captured events to a tracing schema. **v1 = schema only (stdout/file), no network export.**
-
-| Flag | Meaning |
-|------|---------|
-| `--format otel\|openinference\|langfuse\|mlflow` | Target schema (default `otel` → OTLP `resourceSpans` document) |
-| `--trace <hex>` | Only events on this correlated trace id |
-| `--limit <n>` / `--output <file>` | Cap count / write to a file |
-
-### `logbook hub`
-Placeholder — prints `hub: v1.5 — not yet implemented` and exits 0.
-
----
-
-## Output layout
-
-```
-.logbook/
-  latest.txt                 # cleaned text of the most recent run (ANSI stripped)
-  latest.terminal.log        # full transcript (ANSI/control bytes kept, secrets redacted)
-  <slug>.txt / .terminal.log # command-specific "latest"
-  <slug>.<ISO>.txt / …       # timestamped history (unless --no-history)
-  runs.jsonl                 # one record per run (command, key, paths, startedAt)
-  events.jsonl               # structured events (JSONL fallback / portable mirror)
-  logbook.db                 # SQLite event store (the timeline + inventory + findings)
-  collector.json             # {host, port, outDir, pid, startedAt} — NO secret
-  collector.token            # per-run ingest token only, 0600 (when the collector runs)
-```
-
-**Three log tiers** — `*.terminal.log` (faithful transcript, redacted, *not* byte-exact), `*.txt` (cleaned), and structured `Event`s in `logbook.db` / `events.jsonl`.
-
----
-
-## MCP integration
-
-Register the stdio server with your agent (e.g. `.mcp.json` / `.cursor/mcp.json`):
-
-```json
-{ "mcpServers": { "logbook": { "command": "logbook", "args": ["mcp", "--out-dir", ".logbook"] } } }
-```
-
-**Read tools (always available):** `list_log_files`, `tail_log`, `search_logs`, `get_errors`, `get_run_status`, `watch_log`, `browser_console`, `browser_network`, `browser_get_request`, `browser_dom`, `query_timeline`, `get_trace`, `correlate`, `list_findings`, `get_finding`, `debug_fetch_evidence`, `inventory_list_agents`, `inventory_list_mcp`, `inventory_list_sessions`, `inventory_report`, `inventory_findings`.
-
-**Write tools (hidden unless enabled in `logbook.toml`):** `browser_navigate`/`record`/`replay`/`screenshot`/`start_session`, `debug_set_logpoint`/`enable_trace`/`start_session`/`end_session`, `security_scan`, `scan_agent_diff`, `inventory_scan`, `inventory_watch`, `export_otel`.
-
----
+| Command | What it does |
+|---------|--------------|
+| `logbook run -- <cmd>` | Capture any command in a PTY → transcript + cleaned text + structured events |
+| `logbook tail [query] [-- <tail args>]` | Replay/follow a captured run (latest, or fuzzy-matched) |
+| `logbook agent -- <agent-cli>` | Wrap an agent session: transcript + session-accurate file diffs |
+| `logbook codex -- <task>` | Run Codex under capture, recording its `--json` event stream as structured events |
+| `logbook proxy llm --yes [--no-token]` | Opt-in local LLM API proxy — records full provider prompts/responses (Anthropic & OpenAI Chat/Responses) |
+| `logbook proxy mcp -- <server>` | Relay an agent's MCP through logbook, recording redacted tool calls |
+| `logbook hooks` | Receiver for Claude Code hooks / OTLP; prints a ready-to-paste settings recipe |
+| `logbook detect [session]` | Run the risk rules over a session (or recent events); print + persist findings |
+| `logbook guard -- <agent>` | Run an agent, then fail non-zero if a finding crosses `--halt-on` |
+| `logbook revert <session>` | Reverse a clean-tree session's file changes (post-state-hash guarded) |
+| `logbook session export <id>` | Write a per-class sanitized session bundle |
+| `logbook forget <session \| --before <dur>>` | Irreversibly delete a session from store + disk (`--yes`) |
+| `logbook inventory <scan\|watch\|report>` | Discover local agent CLIs, MCP servers, sessions, and risk/shadow items |
+| `logbook security <scan\|import>` | Run scanners (Semgrep/Trivy/cargo-audit) or import any SARIF/JSON |
+| `logbook export --format <otel\|openinference\|langfuse\|mlflow>` | Export the timeline to a tracing schema |
+| `logbook ui` | Embedded web UI — timeline, session replay, inventory, risk feed |
+| `logbook mcp` | Read-only MCP tool surface over stdio for your agent |
+| `logbook hub serve` | Fleet receiver: RBAC, retention, hash-chain audit, multi-endpoint roll-up |
 
 ## Configuration — `logbook.toml`
 
-Loaded from the workspace root (`--root`, default cwd). Shipped defaults are conservative.
+Loaded from the workspace root (`--root`, default cwd). Shipped defaults are conservative; the file is fully optional.
 
 ```toml
-[permissions]
-enabled_writes         = []      # subset of ["browser","dap","security","export","inventory_watch"]; [] = read-only
-allowed_domains        = []      # egress allowlist for browser nav/replay; [] blocks all external navigation
-allow_browser_sessions = false
-allow_dap              = false   # DAP logpoints (alpha)
-allow_security_scans   = false
+[capture]                         # recorder-on by default, within explicitly-started sessions
+enabled = true
+[capture.tiers]
+universal = true
+structured = true
+complete = false                  # the LLM-proxy tier is opt-in by mechanism
 
-[ingest]
-token_mode = "generated"         # "generated" (collector.token, 0600) | "env" (LOGBOOK_INGEST_TOKEN) | "off" (DEV/TEST ONLY)
+[capture.classes.secrets]         # the secrets floor is locked on; this cannot be disabled
+redaction = "always"
+
+[permissions]
+enabled_writes  = []              # ["browser","security","inventory_watch", …]; [] = read-only
+allowed_domains = []              # egress allowlist; [] blocks all external navigation
 
 [redaction]
-enabled = true                   # extra patterns via `deny`; false-positive exclusions via `allow`
-deny    = []
-allow   = []
+enabled = true                    # extra patterns via `deny`; false-positive exclusions via `allow`
+deny = []
+allow = []
 
 [retention]
 max_age_days = 14
 max_db_mb    = 512
-
-[scanners]                        # explicit paths; a missing binary soft-degrades (not an error)
-semgrep = "semgrep"
-trivy = "trivy"
-cargo_audit = "cargo-audit"
 ```
 
----
+## How it's built
 
-## Security & redaction
+A single binary over a Cargo workspace; the event model is defined once and shared by every capture lane.
 
-Redaction runs at three choke points **before persistence**: PTY line assembly, the `/ingest` endpoint, and any MCP tool that returns log/console/network content (plus secrets found in scanned MCP configs). It catches cloud keys, JWTs, `Bearer` tokens, PEM blocks, `user:pass@` URLs, cookies, and env-derived secret values; placeholders preserve length-class (`«REDACTED:KIND:len»`) but not the secret. On by default; `--no-redact` warns.
+| Crate | Responsibility |
+|-------|----------------|
+| `logbook-core` | Unified `Event` model, ids, redaction, capture policy, trace correlation |
+| `logbook-store` | SQLite store (rusqlite + refinery), FTS, retention/prune, hash-chain audit |
+| `logbook-capture` | PTY capture, process-tree supervision, ANSI cleaning, transcript tiers |
+| `logbook-inventory` | Agent/MCP discovery, the `agent` wrapper, session-accurate diffs, revert/export/forget |
+| `logbook-harness` | Harness adapters — Claude Code hooks, Codex `--json`, Aider |
+| `logbook-collector` | Loopback ingest (`/v1/hooks`, `/v1/traces`, browser `/ingest`) + MCP proxy |
+| `logbook-llmproxy` | Opt-in LLM API proxy (Anthropic + OpenAI Chat/Responses), SSE reassembly, force-redaction |
+| `logbook-detect` | Anomaly/risk rule engine → `Finding` events |
+| `logbook-mcp` | rmcp stdio server — read by default, write gated |
+| `logbook-security` | Security scanner runner + SARIF/JSON import |
+| `logbook-export` | OTel / OpenInference / Langfuse / MLflow mapping |
+| `logbook-ui` | Embedded web UI (axum + SSE), serves the prebuilt React bundle |
+| `logbook-hub` | Fleet receiver — RBAC, retention, hash-chain audit, roll-up |
+| `logbook-cli` | The `logbook` binary (clap command tree) |
 
-The collector binds loopback only and requires the per-run bearer token on `/ingest` (401 otherwise). MCP is stdio (no network surface). Inventory is read-only and never modifies a discovered process.
+**The unified event** carries `id`, `trace_id`, `parent_id?`, `timestamp`, `kind`, `category`, `operation`, `name`, `status`, `attributes`, `input?`/`output?`, `session_id?`, plus optional typed blocks (`llm` / `tool` / `agent` / `console` / `network` / `finding`) — so a prompt, a shell command, a file diff, and a security finding all live on one timeline.
 
-> **Known gap (v1):** `runs.jsonl` stores the *wrapped command line verbatim* — a secret passed as a literal CLI argument is not redacted there, even though program **output** is. Fix tracked for `crates/logbook-capture/src/paths.rs`.
+## Notes
 
-## Browser capture
-
-Two interchangeable adapters behind one trait:
-
-- **Injected-JS (default, for your own app):** a small snippet hooks `console.*`, `window.onerror`, `fetch`/XHR, and `PerformanceObserver`, batching to `/ingest` with the per-run token. Insert it via the provided Vite/Next dev-middleware, or paste the snippet `logbook` prints (the token is injected at runtime — the browser never reads `collector.token`).
-- **schrute over MCP (rich):** record→replay, logged-in session reuse, network capture, and stealth (Playwright/patchright/Camoufox). schrute's own SSRF/domain gates are `PENDING` upstream, so logbook enforces its **own** egress allowlist until they're verified in adapter tests.
-
-## Endpoint inventory
-
-`logbook inventory scan` discovers, locally and read-only: installed agent CLIs (claude, cursor, codex, gemini, aider, opencode, …); configured MCP servers across Cursor/Claude/Codex/VS Code/Cline/Zed configs (with secrets redacted); running agent processes; and the presence of `schrute` / `security-suite`. It flags unsanctioned/untracked items as risk/shadow findings and renders five views — **Endpoint · Agents · MCP Servers · Sessions · Risk/Shadow** — in `report` and in the UI.
-
-## Export
-
-The unified `Event` maps to a canonical OpenTelemetry span, then re-keys for OpenInference span-kinds, Langfuse observations, and MLflow spans. v1 emits the document to stdout/file (golden-tested); the network/OTLP push wire lands in v1.5.
-
----
-
-## Architecture
-
-Single binary; a Cargo workspace where `agent` and `hub` modes share `core` + `store`, so the event model is defined once.
-
-| Crate | Responsibility | Drawn from |
-|-------|----------------|-----------|
-| `logbook-core` | unified `Event` model, ids (W3C-width), redaction, errors | new |
-| `logbook-store` | SQLite (rusqlite + refinery) single-writer + read pool; FTS; JSONL fallback | new / OpenLogs |
-| `logbook-capture` | PTY capture, process-tree supervisor, ANSI cleaning, paths/run-index/tail | OpenLogs |
-| `logbook-collector` | axum `/health` + token-gated `/ingest`; injected-JS + schrute adapters | OpenLogs + schrute |
-| `logbook-mcp` | rmcp stdio server; read default, write gated | local-logs-mcp + new |
-| `logbook-debug` | passive evidence + DAP logpoints (alpha) | Cursor (redesigned) + DAP |
-| `logbook-inventory` | agent/MCP discovery, `agent` wrapper, diff watcher, risk findings | new |
-| `logbook-security` | scanner runner + SARIF/JSON import | security-suite |
-| `logbook-ui` | axum static + SSE; embeds `ui/dist` | new |
-| `logbook-export` | OTel/OpenInference/Langfuse/MLflow mapping + golden tests | OTel/OpenInference |
-| `logbook-hub` | v1.5 receiver/retention/audit/RBAC (stub) | new |
-| `logbook-cli` | clap command tree, the `logbook` binary | new |
-
-**Unified event schema:** `id`, `trace_id`, `parent_id?`, `timestamp`, `duration_ms?`, `kind` (span\|event\|log), `type`, `category` (agent\|browser\|app_log\|code_test\|security\|inventory), `operation`, `name`, `status`, `error?`, `attributes`, `input?`, `output?`, `session_id?`, plus optional typed blocks `llm`/`tool`/`agent`/`console`/`network`/`finding`.
-
----
-
-## Roadmap (v1.5+)
-
-- **Hub:** self-hosted receiver + dashboard, retention, audit log, RBAC; multi-endpoint inventory roll-up.
-- **Security governance:** auto-scan the agent's diffs + gate/annotate; strix / pentagi / codeql / nuclei.
-- **Export wire:** OTLP network push (currently schema-only).
-- **Browser:** full Chrome DevTools / CDP performance-trace adapter.
-- **Debug:** broader DAP runtime coverage; (optional, approval-gated) source-instrumentation fallback.
-
-## Development
-
-```sh
-cargo build --workspace
-cargo test  --workspace            # 362 tests, 0 failing
-cargo clippy --workspace --all-targets
-LOGBOOK_BLESS=1 cargo test -p logbook-export   # regenerate export golden fixtures
-```
-
-Edition 2021, resolver 2. The OpenLogs behavioral contract (Ctrl-C → 130, SIGINT grace, `setsid` descendant reaping, tail resolution) is ported as tests in `crates/logbook-capture/tests/`.
-
-## Known limitations
-
-- **POSIX only** (macOS/Linux); Windows is unsupported (errors out, like OpenLogs).
-- `runs.jsonl` stores the command line unredacted (see [Security](#security--redaction)).
-- DAP logpoints are **alpha**; the CLI exposes only the reliable passive debug tier.
-- `debug fetch --query` uses FTS exact-match (no implicit substring/prefix).
-- The collector token contract is unit-tested but not yet verified end-to-end via the CLI.
-- `logbook ui` has no parent-PID watchdog — stop it with Ctrl-C.
+- **macOS / Linux.** (Windows is not supported.)
+- Reversing a session uses git as the preimage, so it applies to **clean-tree** sessions; reverting changes made on top of a dirty working tree is planned (it requires encrypted preimage storage).
+- GUI / IDE assistants that route LLM traffic through their own cloud backend can't be captured by the local proxy — use the wrap or MCP tiers for those.
 
 ## License
 
