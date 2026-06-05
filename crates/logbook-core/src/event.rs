@@ -231,6 +231,14 @@ pub struct LlmBlock {
     /// Reported / estimated cost in USD.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cost_usd: Option<f64>,
+    /// Why generation stopped (e.g. `stop`, `length`, `tool_use`,
+    /// `content_filter`). Provider-reported, free-form.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finish_reason: Option<String>,
+    /// Whether the call was made in streaming mode (SSE reassembled before
+    /// redaction). `None` when the producer did not record it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stream: Option<bool>,
 }
 
 /// Tool / function-call details.
@@ -245,6 +253,11 @@ pub struct ToolBlock {
     /// Arguments passed to the tool (already redacted).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub arguments: Option<serde_json::Value>,
+    /// Short, already-redacted summary of the tool result (the full result is
+    /// the largest leak surface and is force-redacted/capped at the persistence
+    /// boundary; this is a compact, redaction-safe digest).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result_summary: Option<String>,
 }
 
 /// Agent step / turn details.
@@ -259,6 +272,17 @@ pub struct AgentBlock {
     /// Free-form role (`user`, `assistant`, `system`, `tool`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub role: Option<String>,
+    /// Zero-based turn index within the session. Coarser than `step`: a turn
+    /// groups the steps produced by one user/assistant exchange (used for the
+    /// turn/step tree and fast grouping; mirrors the optional `events.turn`
+    /// column added in V3).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn: Option<u64>,
+    /// Harness-assigned id of the tool call this agent step is linked to, when
+    /// the step corresponds to a tool invocation. Lets a `Kind::Tool` event be
+    /// correlated back to its originating turn beyond `parent_id`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
 }
 
 /// Browser/process console details.
@@ -727,6 +751,152 @@ mod tests {
         let json = serde_json::to_string(&ev).unwrap();
         let back: Event = serde_json::from_str(&json).unwrap();
         assert_eq!(ev, back);
+    }
+
+    #[test]
+    fn llm_block_enrichment_roundtrips() {
+        // finish_reason + stream survive a serialize → deserialize round-trip
+        // and flatten onto the parent under the `llm` key.
+        let ev = Event::new(TraceId::new(), Kind::Llm, Category::Agent, "chat.completion")
+            .with_llm(LlmBlock {
+                model: Some("claude-3-5-sonnet".into()),
+                finish_reason: Some("tool_use".into()),
+                stream: Some(true),
+                ..Default::default()
+            });
+        let json = serde_json::to_value(&ev).unwrap();
+        // Each block flattens onto the Event as a top-level block KEY (`llm`);
+        // its fields live nested under it.
+        assert_eq!(json["llm"]["finish_reason"], serde_json::json!("tool_use"));
+        assert_eq!(json["llm"]["stream"], serde_json::json!(true));
+
+        let back: Event = serde_json::from_value(json).unwrap();
+        assert_eq!(ev, back);
+        let llm = back.blocks.llm.unwrap();
+        assert_eq!(llm.finish_reason.as_deref(), Some("tool_use"));
+        assert_eq!(llm.stream, Some(true));
+    }
+
+    #[test]
+    fn tool_block_result_summary_roundtrips() {
+        let ev = Event::new(TraceId::new(), Kind::Tool, Category::Agent, "tool.call")
+            .with_tool(ToolBlock {
+                tool_name: Some("read_file".into()),
+                result_summary: Some("read 42 lines".into()),
+                ..Default::default()
+            });
+        let json = serde_json::to_value(&ev).unwrap();
+        assert_eq!(json["tool"]["result_summary"], serde_json::json!("read 42 lines"));
+
+        let back: Event = serde_json::from_value(json).unwrap();
+        assert_eq!(ev, back);
+        assert_eq!(
+            back.blocks.tool.unwrap().result_summary.as_deref(),
+            Some("read 42 lines")
+        );
+    }
+
+    #[test]
+    fn agent_block_turn_and_tool_call_id_roundtrip() {
+        let ev = Event::new(TraceId::new(), Kind::Agent, Category::Agent, "agent.turn")
+            .with_agent(AgentBlock {
+                agent: Some("claude".into()),
+                step: Some(3),
+                turn: Some(2),
+                tool_call_id: Some("call_abc123".into()),
+                ..Default::default()
+            });
+        let json = serde_json::to_value(&ev).unwrap();
+        assert_eq!(json["agent"]["turn"], serde_json::json!(2));
+        assert_eq!(json["agent"]["tool_call_id"], serde_json::json!("call_abc123"));
+
+        let back: Event = serde_json::from_value(json).unwrap();
+        assert_eq!(ev, back);
+        let agent = back.blocks.agent.unwrap();
+        assert_eq!(agent.turn, Some(2));
+        assert_eq!(agent.tool_call_id.as_deref(), Some("call_abc123"));
+    }
+
+    #[test]
+    fn agent_block_turn_flattens_onto_parent_and_parses() {
+        // An Event carrying an AgentBlock.turn flattens `turn` directly onto the
+        // parent object (not nested under an `agent` key), and a hand-written
+        // flat JSON object parses back into the typed block.
+        let ev = Event::new(TraceId::new(), Kind::Agent, Category::Agent, "agent.turn")
+            .with_agent(AgentBlock {
+                turn: Some(7),
+                ..Default::default()
+            });
+        let json = serde_json::to_value(&ev).unwrap();
+        // The `agent` block flattens onto the Event as a top-level `agent` key
+        // (the block KEY is flat — there is no nested `blocks` wrapper); the
+        // block's fields live nested under that key.
+        assert_eq!(json["agent"]["turn"], serde_json::json!(7));
+        assert!(
+            json.get("blocks").is_none(),
+            "blocks flatten onto the Event; there is no nested `blocks` wrapper"
+        );
+
+        // Parse a minimal flat object back; `turn` should land on the AgentBlock.
+        let parsed: Event = serde_json::from_value(json).unwrap();
+        assert_eq!(parsed.blocks.agent.as_ref().and_then(|a| a.turn), Some(7));
+        // The block is detectable and the event is still coherent.
+        assert!(!parsed.blocks.is_empty());
+        assert!(parsed.validate().is_ok());
+    }
+
+    #[test]
+    fn enrichment_fields_omitted_when_absent() {
+        // The new optional fields use skip_serializing_if = Option::is_none, so a
+        // default block emits none of them (matching the existing block fields).
+        let ev = Event::new(TraceId::new(), Kind::Agent, Category::Agent, "agent.turn")
+            .with_agent(AgentBlock {
+                agent: Some("claude".into()),
+                ..Default::default()
+            });
+        let json = serde_json::to_value(&ev).unwrap();
+        assert!(json.get("turn").is_none(), "absent turn must be omitted");
+        assert!(
+            json.get("tool_call_id").is_none(),
+            "absent tool_call_id must be omitted"
+        );
+
+        let ev = Event::new(TraceId::new(), Kind::Llm, Category::Agent, "chat.completion")
+            .with_llm(LlmBlock {
+                model: Some("m".into()),
+                ..Default::default()
+            });
+        let json = serde_json::to_value(&ev).unwrap();
+        assert!(json.get("finish_reason").is_none());
+        assert!(json.get("stream").is_none());
+
+        let ev = Event::new(TraceId::new(), Kind::Tool, Category::Agent, "tool.call")
+            .with_tool(ToolBlock {
+                tool_name: Some("t".into()),
+                ..Default::default()
+            });
+        let json = serde_json::to_value(&ev).unwrap();
+        assert!(json.get("result_summary").is_none());
+    }
+
+    #[test]
+    fn enriched_agent_block_still_validates_as_single_block() {
+        // Adding fields to AgentBlock must not change the "at most one typed
+        // block" rule: an enriched agent event is still exactly one block.
+        let ev = Event::new(TraceId::new(), Kind::Agent, Category::Agent, "agent.turn")
+            .with_agent(AgentBlock {
+                turn: Some(1),
+                tool_call_id: Some("call_x".into()),
+                ..Default::default()
+            });
+        assert!(ev.validate().is_ok());
+        ev.debug_assert_valid();
+        // Two blocks (agent + tool) still rejected, enrichment notwithstanding.
+        let ev = ev.with_tool(ToolBlock {
+            result_summary: Some("s".into()),
+            ..Default::default()
+        });
+        assert!(ev.validate().is_err());
     }
 
     #[test]
