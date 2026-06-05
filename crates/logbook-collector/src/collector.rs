@@ -291,7 +291,12 @@ pub async fn start(
     let redactor = if config.redact {
         Redactor::new().with_process_env()
     } else {
-        Redactor::disabled()
+        // Secrets floor (plan §9: "`--no-redact` can never expose a secret").
+        // `--no-redact` disables only the general/`deny`-pattern layer; the
+        // mandatory floor still scrubs cloud keys, JWT, bearer, PEM, … plus the
+        // process env's secret-looking values from every persisted `/ingest`
+        // event. Mirrors logbook-capture `pty.rs` and logbook-inventory `cli.rs`.
+        Redactor::secrets_floor_with_process_env()
     };
 
     let state = AppState {
@@ -760,6 +765,48 @@ mod tests {
         let out = normalize_browser_event(&ev, TraceId::new(), &r);
         assert_eq!(out.status, Status::Error);
         assert_eq!(out.error.as_deref(), Some("boom"));
+    }
+
+    #[test]
+    fn no_redact_still_applies_secrets_floor() {
+        // Regression (plan §9: "`--no-redact` can never expose a secret"). When
+        // `config.redact == false` the `/ingest` redactor is the mandatory
+        // secrets floor, NOT a passthrough, so an ingested AWS-style key is still
+        // scrubbed from the persisted event while benign text survives. This is
+        // the exact redactor `start` now builds for the `redact = false` branch.
+        let floor = Redactor::secrets_floor_with_process_env();
+        assert!(
+            floor.is_secrets_floor(),
+            "redact=false must build the mandatory secrets floor, not a passthrough"
+        );
+
+        let trace = TraceId::new();
+        let ev = BrowserEvent {
+            message: Some("creds AKIAIOSFODNN7EXAMPLE benignword".into()),
+            url: Some("https://logs.example/AKIAIOSFODNN7EXAMPLE/path".into()),
+            ..Default::default()
+        };
+        let out = normalize_browser_event(&ev, trace, &floor);
+
+        let console = out.blocks.console.as_ref().unwrap();
+        let msg = console.message.as_ref().unwrap();
+        assert!(
+            !msg.contains("AKIAIOSFODNN7EXAMPLE"),
+            "secret persisted under --no-redact: {msg}"
+        );
+        assert!(
+            msg.contains("REDACTED:CLOUD_KEY:"),
+            "expected secrets-floor placeholder: {msg}"
+        );
+        assert!(msg.contains("benignword"), "over-redacted benign text: {msg}");
+
+        // The same floor scrubs the URL field, not just the message.
+        let url = console.url.as_ref().unwrap();
+        assert!(
+            !url.contains("AKIAIOSFODNN7EXAMPLE"),
+            "secret persisted in url under --no-redact: {url}"
+        );
+        assert!(url.contains("REDACTED:CLOUD_KEY:"), "url not scrubbed: {url}");
     }
 
     #[test]
