@@ -294,6 +294,19 @@ pub struct LlmProxyArgs {
     #[arg(long)]
     pub no_redact: bool,
 
+    /// Run the proxy with **no** `x-logbook-proxy-token` gate — **LOCAL
+    /// SINGLE-USER / dev use only**. The proxy is always loopback-only, but on a
+    /// **shared** host the token is what defends against OTHER local users: it
+    /// stops any other process on the box from posting to the proxy (and thereby
+    /// capturing — or injecting — provider traffic through your recorder). With
+    /// `--no-token` that defence is gone — *any* local process can hit the proxy
+    /// — so it is strictly opt-in. The upside: the wrapped agent no longer has to
+    /// send a custom header, which removes startup friction for the common case of
+    /// a single user on their own machine. When unset, the token is sourced from
+    /// `LOGBOOK_LLMPROXY_TOKEN` if present, else freshly generated at startup.
+    #[arg(long, default_value_t = false)]
+    pub no_token: bool,
+
     /// Additionally extend the tamper-evident audit hash chain over each recorded
     /// (already-redacted) event.
     #[arg(long, default_value_t = false)]
@@ -392,13 +405,14 @@ fn run_llm(args: LlmProxyArgs) -> anyhow::Result<i32> {
         .clone()
         .unwrap_or_else(|| provider.default_base_url().to_string());
 
-    // Source the bearer token like the other servers: an explicit env var wins,
-    // else mint a fresh one at startup.
-    let token_mode = if std::env::var_os(logbook_llmproxy::ENV_TOKEN_VAR).is_some() {
-        TokenMode::Env
-    } else {
-        TokenMode::Generated
-    };
+    // Source the bearer token: `--no-token` wins (forces the gate OFF for a local
+    // single-user box), else the established order — an explicit env var wins, else
+    // mint a fresh one at startup. Factored into `resolve_token_mode` so the
+    // precedence is unit-tested without binding a port.
+    let token_mode = resolve_token_mode(
+        args.no_token,
+        std::env::var_os(logbook_llmproxy::ENV_TOKEN_VAR).is_some(),
+    );
 
     let mut config = LlmProxyConfig::single(provider, base_url.clone())
         .with_port(args.port)
@@ -476,6 +490,26 @@ fn resolve_llm_policy(root: &std::path::Path, out_dir: &std::path::Path, no_reda
     policy
 }
 
+/// Resolve which [`TokenMode`] the `llm` proxy starts under, from the
+/// `--no-token` flag and whether [`logbook_llmproxy::ENV_TOKEN_VAR`] is set.
+///
+/// `--no-token` is the **highest-precedence** input: when set it forces
+/// [`TokenMode::Off`] (no gate — local single-user / dev only) regardless of the
+/// env var, so a stray `LOGBOOK_LLMPROXY_TOKEN` in the environment cannot
+/// silently re-arm the gate the user explicitly asked to drop. Otherwise we keep
+/// the established source order the other servers use: an explicit env var wins
+/// ([`TokenMode::Env`], which hard-errors later if unset/empty), else mint a fresh
+/// token at startup ([`TokenMode::Generated`]).
+fn resolve_token_mode(no_token: bool, env_token_set: bool) -> TokenMode {
+    if no_token {
+        TokenMode::Off
+    } else if env_token_set {
+        TokenMode::Env
+    } else {
+        TokenMode::Generated
+    }
+}
+
 /// Print the `*_BASE_URL` to export, the proxy token (sent on the dedicated
 /// `x-logbook-proxy-token` header — NOT `Authorization`, which carries the real
 /// provider key), and how to point an agent at the proxy. Goes to **stdout** (the
@@ -522,6 +556,24 @@ fn print_llm_instructions(
                  {provider_key_header}\n\
                  (the {env_var} env var above only points the agent at logbook; the proxy\n\
                  authenticates on {} and leaves the provider key untouched.)",
+                logbook_llmproxy::server::PROXY_TOKEN_HEADER
+            );
+            // Ready-to-paste recipe so the user need not hand-craft the header.
+            // Claude Code reads `ANTHROPIC_CUSTOM_HEADERS` and adds it to every
+            // request, so for Anthropic we can hand the user a one-liner.
+            if let Provider::Anthropic = provider {
+                println!();
+                println!("Ready-to-paste for Claude Code (it forwards ANTHROPIC_CUSTOM_HEADERS):");
+                println!(
+                    "  export ANTHROPIC_CUSTOM_HEADERS=\"{}: {token}\"",
+                    logbook_llmproxy::server::PROXY_TOKEN_HEADER
+                );
+            }
+            println!();
+            println!(
+                "Other agents/SDKs must add the {} header by their own mechanism\n\
+                 (custom-header config, a wrapping proxy, etc.) — or, for a local\n\
+                 single-user box, re-run with `--no-token` to drop the gate entirely.",
                 logbook_llmproxy::server::PROXY_TOKEN_HEADER
             );
         }
@@ -680,9 +732,10 @@ mod tests {
         assert_eq!(l.out_dir, PathBuf::from(super::super::DEFAULT_OUT_DIR));
         assert_eq!(l.root, PathBuf::from("."));
         assert_eq!(l.port, 0);
-        // The acknowledgement and the redaction/audit knobs all default off.
+        // The acknowledgement and the redaction/token/audit knobs all default off.
         assert!(!l.yes);
         assert!(!l.no_redact);
+        assert!(!l.no_token);
         assert!(!l.audit);
     }
 
@@ -691,7 +744,7 @@ mod tests {
         let l = parse_llm(&[
             "x", "proxy", "llm", "--provider", "openai", "--upstream",
             "https://gateway.example/v1", "--out-dir", "/tmp/o", "--root", "/repo", "--port",
-            "9100", "--yes", "--no-redact", "--audit",
+            "9100", "--yes", "--no-redact", "--no-token", "--audit",
         ]);
         assert_eq!(l.provider, ProviderArg::Openai);
         assert_eq!(l.upstream.as_deref(), Some("https://gateway.example/v1"));
@@ -700,6 +753,7 @@ mod tests {
         assert_eq!(l.port, 9100);
         assert!(l.yes);
         assert!(l.no_redact);
+        assert!(l.no_token);
         assert!(l.audit);
         assert_eq!(l.provider.as_provider(), Provider::OpenAi);
     }
@@ -728,6 +782,7 @@ mod tests {
             port: 0,
             yes: false,
             no_redact: false,
+            no_token: false,
             audit: false,
         };
         let code = run_llm(args).expect("refusal is a clean decline, not an error");
@@ -743,6 +798,33 @@ mod tests {
     fn provider_arg_maps_to_library_provider() {
         assert_eq!(ProviderArg::Anthropic.as_provider(), Provider::Anthropic);
         assert_eq!(ProviderArg::Openai.as_provider(), Provider::OpenAi);
+    }
+
+    /// Token-mode resolution (`resolve_token_mode`), the exact decision `run_llm`
+    /// makes from `--no-token` and whether `LOGBOOK_LLMPROXY_TOKEN` is set. Tested
+    /// against the pure helper so no env mutation or port bind is needed.
+    ///
+    /// - `--no-token` ⇒ [`TokenMode::Off`], and it WINS even when the env var is
+    ///   set (the user explicitly dropped the gate; a stray env token must not
+    ///   silently re-arm it).
+    /// - not set + env unset ⇒ [`TokenMode::Generated`] (mint a fresh token).
+    /// - not set + env set ⇒ [`TokenMode::Env`] (the established source order).
+    #[test]
+    fn resolve_token_mode_precedence() {
+        // `--no-token` forces Off regardless of the env var.
+        assert_eq!(resolve_token_mode(true, false), TokenMode::Off);
+        assert_eq!(
+            resolve_token_mode(true, true),
+            TokenMode::Off,
+            "--no-token must win over a set LOGBOOK_LLMPROXY_TOKEN"
+        );
+        // Without the flag: env-or-generated, as before.
+        assert_eq!(
+            resolve_token_mode(false, false),
+            TokenMode::Generated,
+            "no flag and no env var ⇒ mint a fresh token"
+        );
+        assert_eq!(resolve_token_mode(false, true), TokenMode::Env);
     }
 
     /// The `--yes` runtime enable must raise the tiers CUMULATIVELY: with no
