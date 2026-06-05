@@ -63,12 +63,17 @@ pub enum InventoryError {
     )]
     ReversibleUnavailable,
 
-    /// A Phase-2/4 capture flag was passed that has no mechanism in Phase 1
-    /// (`--capture-prompts`, `--tier structured|complete`). Rejected rather than
-    /// silently no-op'd so the user is not misled.
-    #[error("{flag}: structured capture lands in Phase 2 (not available yet)")]
+    /// A capture flag was passed that has no mechanism wired here yet. As of
+    /// Phase 2 the structured tier has landed (`--capture-prompts` / `--tier
+    /// structured` are accepted), so only `--tier complete` (the Phase-4
+    /// raw-provider-traffic tier) and an unrecognized `--tier` value are
+    /// rejected — rather than silently no-op'd so the user is not misled.
+    #[error(
+        "{flag} is not available: the complete tier (full provider traffic) is \
+         opt-in by mechanism and ships in Phase 4"
+    )]
     UnsupportedFlag {
-        /// The rejected flag (e.g. `--capture-prompts`).
+        /// The rejected flag (e.g. `--tier complete`).
         flag: String,
     },
 }

@@ -5,7 +5,7 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
-description = "logbook CLI: run | tail | mcp | ui | agent | debug | inventory | security | export | hub."
+description = "logbook CLI: run | tail | mcp | proxy | hooks | ui | agent | debug | inventory | security | export | hub."
 
 [[bin]]
 name = "logbook"
@@ -17,6 +17,10 @@ logbook-collector = { version = "0.1.0", path = "../logbook-collector" }
 logbook-core = { version = "0.1.0", path = "../logbook-core" }
 logbook-debug = { version = "0.1.0", path = "../logbook-debug" }
 logbook-export = { version = "0.1.0", path = "../logbook-export" }
+# logbook-harness powers `logbook proxy mcp` (the HarnessContext the recording
+# MCP transport routes redacted tool payloads through). Referenced by path,
+# matching logbook-collector: it is not (yet) a [workspace.dependencies] entry.
+logbook-harness = { version = "0.1.0", path = "../logbook-harness" }
 logbook-inventory = { version = "0.1.0", path = "../logbook-inventory" }
 logbook-mcp = { version = "0.1.0", path = "../logbook-mcp" }
 logbook-security = { version = "0.1.0", path = "../logbook-security" }

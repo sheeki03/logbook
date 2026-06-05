@@ -124,13 +124,26 @@ pub struct AgentArgs {
     #[arg(long)]
     pub no_redact: bool,
 
-    /// Phase-2 flag (rejected in Phase 1): structured prompt capture has no
-    /// mechanism yet, so this is refused rather than silently no-op'd.
-    #[arg(long)]
+    /// Opt in to structured prompt capture (the recorder-on default).
+    /// **Accepted as of Phase 2** (the structured tier now exists): it affirms
+    /// the `prompts` class for this session. Structured prompt capture is
+    /// *consumed* by the prompt-bearing lanes — harness hooks / `logbook proxy
+    /// mcp` — which redact + cap prompts per the `prompts` class; the `agent`
+    /// wrapper itself records only transcript + diffs. The mandatory secrets
+    /// floor always applies.
+    #[arg(long, overrides_with = "no_capture_prompts")]
     pub capture_prompts: bool,
+    /// Disable the `prompts` class for this session, turning structured prompt
+    /// capture off in the resolved policy (the prompt-bearing lanes will not
+    /// persist prompts). The secrets floor still applies.
+    #[arg(long, overrides_with = "capture_prompts")]
+    pub no_capture_prompts: bool,
 
-    /// Fidelity tier. Only `universal` is meaningful in Phase 1; `structured` /
-    /// `complete` are **rejected** (they land in Phase 2 / Phase 4).
+    /// Fidelity tier. `universal` and `structured` are accepted (Phase 1 +
+    /// Phase 2); `complete` is still **rejected** (the Phase-4 LLM-proxy tier
+    /// is opt-in by mechanism and not wired here yet). `structured` keeps the
+    /// structured tier (and `prompts` class) on; structured prompt capture is
+    /// consumed by the hook/proxy path, not by the `agent` wrapper itself.
     #[arg(long)]
     pub tier: Option<String>,
 
@@ -152,35 +165,102 @@ impl AgentArgs {
         }
     }
 
-    /// Reject the Phase-2/4 flags that have no capture mechanism in Phase 1, so a
-    /// user is never misled into thinking structured capture is happening.
+    /// The resolved `--capture-prompts` / `--no-capture-prompts` choice as a
+    /// tri-state (`None` = neither flag set, leave the resolved `prompts.capture`
+    /// untouched; `Some(true)`/`Some(false)` = force the class on/off). Mirrors
+    /// [`Self::capture_diffs_choice`]; the two flags are mutually `overrides_with`
+    /// so clap keeps the last one set.
+    fn capture_prompts_choice(&self) -> Option<bool> {
+        match (self.capture_prompts, self.no_capture_prompts) {
+            (true, _) => Some(true),
+            (_, true) => Some(false),
+            _ => None,
+        }
+    }
+
+    /// Reject only the capture flags with no mechanism **yet**. As of Phase 2 the
+    /// structured tier exists, so `--capture-prompts` and `--tier structured` are
+    /// **accepted** (the recorder-on `prompts` class is reachable on the
+    /// structured lanes); only `--tier complete` (the Phase-4 LLM-proxy tier,
+    /// opt-in by mechanism) and an unknown tier value are refused.
     ///
     /// # Errors
-    /// Returns [`InventoryError::UnsupportedFlag`] for `--capture-prompts` or a
-    /// `--tier structured|complete`.
-    fn reject_phase2_flags(&self) -> Result<()> {
-        if self.capture_prompts {
-            return Err(crate::error::InventoryError::UnsupportedFlag {
-                flag: "--capture-prompts".to_string(),
-            });
-        }
+    /// Returns [`InventoryError::UnsupportedFlag`] for `--tier complete` or an
+    /// unrecognized `--tier` value.
+    fn reject_unsupported_flags(&self) -> Result<()> {
         if let Some(tier) = self.tier.as_deref() {
             match tier.to_ascii_lowercase().as_str() {
-                "universal" => {}
-                "structured" | "complete" => {
+                // Phase 1 + Phase 2 tiers are both live now.
+                "universal" | "structured" => {}
+                // Phase-4 only: the complete tier reroutes provider traffic via
+                // the (not-yet-wired) LLM proxy and stays opt-in by mechanism.
+                "complete" => {
                     return Err(crate::error::InventoryError::UnsupportedFlag {
-                        flag: format!("--tier {tier}"),
+                        flag: "--tier complete".to_string(),
                     });
                 }
                 other => {
                     return Err(crate::error::InventoryError::UnsupportedFlag {
-                        flag: format!("--tier {other} (expected `universal`)"),
+                        flag: format!("--tier {other} (expected `universal` or `structured`)"),
                     });
                 }
             }
         }
         Ok(())
     }
+
+    /// Whether `--capture-prompts` (or `--tier structured`) affirmed the
+    /// structured tier for this session. Both are accepted opt-ins as of Phase 2;
+    /// either one signals the structured tier should stay on. `--no-capture-prompts`
+    /// does **not** count — it only narrows the `prompts` class, not the tier
+    /// (a session can keep the structured tier for tool args/results/metadata
+    /// while opting prompts out).
+    fn structured_capture_requested(&self) -> bool {
+        matches!(self.capture_prompts_choice(), Some(true))
+            || matches!(self.tier.as_deref().map(str::to_ascii_lowercase).as_deref(), Some("structured"))
+    }
+}
+
+/// Resolve the effective [`CapturePolicy`] for an `agent` session: run the shared
+/// fail-closed [`CapturePolicy::resolve`] (defaults → strict `logbook.toml` →
+/// `<out_dir>/capture-state.json` narrow-only → [`CliOverlay`]), then layer the
+/// CLI flags that the core `CliOverlay` does not (yet) model.
+///
+/// `CliOverlay` (in `logbook-core`) carries `--capture-diffs` / `--diff-max-bytes`
+/// / `--no-redact` / a master switch, but has **no `prompts` field**. Per the
+/// cross-crate boundary we do not edit `logbook-core` here, so the
+/// `prompts`-class CLI flags are applied by mutating the *resolved* policy
+/// directly — mirroring how [`CliOverlay::apply`] sets a class.
+///
+/// **Cross-crate note:** the cleanest long-term home for this is a
+/// `CliOverlay { prompts: Option<bool> }` field (so `resolve()` owns the whole
+/// CLI layer). Until `logbook-core` grows that field, the threading lives here.
+///
+/// Semantics:
+/// - `--tier structured` (or `--capture-prompts`) affirms `tiers.structured` so
+///   the `prompts`-class lanes (harness hooks / `logbook proxy mcp`) stay
+///   reachable; the wrapper itself records only transcript + diffs.
+/// - `prompts.capture` follows the explicit tri-state: `--capture-prompts` ⇒ on,
+///   `--no-capture-prompts` ⇒ off, neither ⇒ leave the layered value untouched.
+///
+/// The secrets floor is never relaxed, and prompt-bearing lanes still
+/// force-redact + cap per the `prompts` class regardless of these flags.
+fn resolve_agent_policy(args: &AgentArgs, root: &std::path::Path, out_dir: &std::path::Path) -> CapturePolicy {
+    let overlay = CliOverlay {
+        capture_diffs: args.capture_diffs_choice(),
+        diff_max_bytes: args.diff_max_bytes,
+        no_redact: args.no_redact,
+        master_enabled: None,
+    };
+    let mut policy = CapturePolicy::resolve(root, out_dir, overlay);
+
+    if args.structured_capture_requested() {
+        policy.tiers.structured = true;
+    }
+    if let Some(capture_prompts) = args.capture_prompts_choice() {
+        policy.classes.prompts.capture = capture_prompts;
+    }
+    policy
 }
 
 /// Dispatch an `inventory` invocation, writing output to `out`.
@@ -286,8 +366,10 @@ pub fn run_agent_wrapper_in(
     project: PathBuf,
     out: &mut impl Write,
 ) -> Result<()> {
-    // Reject Phase-2/4 flags up front (no misleading no-ops).
-    args.reject_phase2_flags()?;
+    // Reject only the flags with no mechanism yet. As of Phase 2 the structured
+    // tier is live, so `--capture-prompts` / `--tier structured` are accepted;
+    // only `--tier complete` (Phase 4) is refused.
+    args.reject_unsupported_flags()?;
 
     // The general-redaction switch from `[redaction].enabled` (the security-
     // bearing capture policy is loaded fail-closed below via `resolve`; this soft
@@ -295,15 +377,11 @@ pub fn run_agent_wrapper_in(
     let inv_cfg = crate::config::InventoryConfig::load_from_dir(&project);
     let general_redaction_enabled = inv_cfg.redaction.enabled && !args.no_redact;
 
-    // Resolve the capture policy through the shared fail-closed helper, layering
-    // the CLI flags on top (`--capture-diffs`, `--diff-max-bytes`, `--no-redact`).
-    let overlay = CliOverlay {
-        capture_diffs: args.capture_diffs_choice(),
-        diff_max_bytes: args.diff_max_bytes,
-        no_redact: args.no_redact,
-        master_enabled: None,
-    };
-    let policy = CapturePolicy::resolve(&project, &args.out_dir, overlay);
+    // Resolve the capture policy through the shared fail-closed helper, then layer
+    // the CLI flags on top (`--capture-diffs`, `--diff-max-bytes`, `--no-redact`,
+    // and the `prompts`-class flags). Extracted so the resolved policy can be
+    // asserted on directly in tests.
+    let policy = resolve_agent_policy(args, &project, &args.out_dir);
 
     // Build the redactor: the full general redactor when enabled (honouring the
     // user's `[redaction] deny`/`allow` patterns), else the secrets floor only.
@@ -506,6 +584,7 @@ mod tests {
             reversible: false,
             no_redact: false,
             capture_prompts: false,
+            no_capture_prompts: false,
             tier: None,
             command,
         }
@@ -567,23 +646,177 @@ mod tests {
     }
 
     #[test]
-    fn rejects_phase2_flags() {
+    fn accepts_structured_flags_rejects_only_complete() {
+        // Phase 2: the structured tier exists, so `--capture-prompts` and
+        // `--tier structured` are now ACCEPTED (no longer rejected). Only
+        // `--tier complete` (Phase 4) and an unknown tier remain refused.
         let outdir = tempfile::tempdir().unwrap();
-        // --capture-prompts is rejected.
+
+        // --capture-prompts is accepted and flags structured capture.
         let mut a = agent_args(outdir.path().to_path_buf(), vec!["/bin/sh".into()]);
         a.capture_prompts = true;
-        assert!(matches!(
-            a.reject_phase2_flags(),
-            Err(crate::error::InventoryError::UnsupportedFlag { .. })
-        ));
-        // --tier structured / complete are rejected; universal is accepted.
+        assert!(a.reject_unsupported_flags().is_ok(), "--capture-prompts now accepted");
+        assert!(a.structured_capture_requested());
+
+        // --tier universal / structured accepted; complete + unknown rejected.
         let mut a2 = agent_args(outdir.path().to_path_buf(), vec!["/bin/sh".into()]);
-        a2.tier = Some("structured".into());
-        assert!(a2.reject_phase2_flags().is_err());
-        a2.tier = Some("complete".into());
-        assert!(a2.reject_phase2_flags().is_err());
         a2.tier = Some("universal".into());
-        assert!(a2.reject_phase2_flags().is_ok());
+        assert!(a2.reject_unsupported_flags().is_ok());
+        assert!(!a2.structured_capture_requested(), "universal is not structured");
+
+        a2.tier = Some("structured".into());
+        assert!(a2.reject_unsupported_flags().is_ok(), "--tier structured now accepted");
+        assert!(a2.structured_capture_requested());
+
+        // Case-insensitive.
+        a2.tier = Some("STRUCTURED".into());
+        assert!(a2.reject_unsupported_flags().is_ok());
+        assert!(a2.structured_capture_requested());
+
+        a2.tier = Some("complete".into());
+        assert!(
+            matches!(
+                a2.reject_unsupported_flags(),
+                Err(crate::error::InventoryError::UnsupportedFlag { .. })
+            ),
+            "--tier complete still rejected (Phase 4)"
+        );
+
+        a2.tier = Some("bogus".into());
+        assert!(a2.reject_unsupported_flags().is_err(), "unknown tier rejected");
+    }
+
+    #[test]
+    fn structured_flags_parse_after_subcommand() {
+        // The new accepted flags parse cleanly before the trailing command.
+        let cli = TestCli::try_parse_from([
+            "x", "agent", "--capture-prompts", "--tier", "structured", "--", "claude",
+        ])
+        .unwrap();
+        match cli.inv {
+            TopCmd::Agent(a) => {
+                assert!(a.capture_prompts);
+                assert_eq!(a.tier.as_deref(), Some("structured"));
+                assert!(a.structured_capture_requested());
+                assert!(a.reject_unsupported_flags().is_ok());
+                assert_eq!(a.command, vec!["claude"]);
+            }
+            _ => panic!("expected agent"),
+        }
+    }
+
+    #[test]
+    fn no_capture_prompts_flag_parses_and_overrides_capture_prompts() {
+        // `--no-capture-prompts` parses, yields the `Some(false)` tri-state, and
+        // (being mutually `overrides_with`) wins as the last flag set.
+        let cli = TestCli::try_parse_from([
+            "x", "agent", "--no-capture-prompts", "--", "claude",
+        ])
+        .unwrap();
+        match cli.inv {
+            TopCmd::Agent(a) => {
+                assert!(a.no_capture_prompts && !a.capture_prompts);
+                assert_eq!(a.capture_prompts_choice(), Some(false));
+                // `--no-capture-prompts` narrows the class, it does not request
+                // the structured tier.
+                assert!(!a.structured_capture_requested());
+            }
+            _ => panic!("expected agent"),
+        }
+
+        // clap `overrides_with`: the last of the two mutually-exclusive flags wins.
+        let last_off = TestCli::try_parse_from([
+            "x", "agent", "--capture-prompts", "--no-capture-prompts", "--", "claude",
+        ])
+        .unwrap();
+        match last_off.inv {
+            TopCmd::Agent(a) => assert_eq!(a.capture_prompts_choice(), Some(false)),
+            _ => panic!("expected agent"),
+        }
+        let last_on = TestCli::try_parse_from([
+            "x", "agent", "--no-capture-prompts", "--capture-prompts", "--", "claude",
+        ])
+        .unwrap();
+        match last_on.inv {
+            TopCmd::Agent(a) => assert_eq!(a.capture_prompts_choice(), Some(true)),
+            _ => panic!("expected agent"),
+        }
+    }
+
+    #[test]
+    fn no_capture_prompts_makes_resolved_policy_not_capture_prompts() {
+        // HIGH-fix regression: `--capture-prompts=false` (i.e. `--no-capture-prompts`)
+        // must actually flip the *resolved* `prompts` class off — the bug was that
+        // the flag was a no-op and prompts could never be turned off.
+        let outdir = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap(); // no logbook.toml ⇒ recorder-on defaults
+
+        // Baseline: with neither flag, the recorder-on default keeps prompts on.
+        let bare = agent_args(outdir.path().to_path_buf(), vec!["/bin/sh".into()]);
+        let base_policy = resolve_agent_policy(&bare, project.path(), outdir.path());
+        assert!(
+            base_policy.classes.prompts.capture,
+            "recorder-on default captures prompts"
+        );
+        assert!(base_policy.should_capture(SensitivityClass::Prompts));
+
+        // `--no-capture-prompts` ⇒ resolved policy does NOT capture prompts.
+        let mut off = agent_args(outdir.path().to_path_buf(), vec!["/bin/sh".into()]);
+        off.no_capture_prompts = true;
+        let off_policy = resolve_agent_policy(&off, project.path(), outdir.path());
+        assert!(
+            !off_policy.classes.prompts.capture,
+            "--no-capture-prompts must turn the prompts class off in the resolved policy"
+        );
+        assert!(
+            !off_policy.should_capture(SensitivityClass::Prompts),
+            "should_capture(Prompts) must be false once the flag turns it off"
+        );
+
+        // `--capture-prompts` ⇒ affirms the structured tier + keeps prompts on.
+        let mut on = agent_args(outdir.path().to_path_buf(), vec!["/bin/sh".into()]);
+        on.capture_prompts = true;
+        let on_policy = resolve_agent_policy(&on, project.path(), outdir.path());
+        assert!(on_policy.tiers.structured, "--capture-prompts keeps structured tier on");
+        assert!(on_policy.classes.prompts.capture);
+        assert!(on_policy.should_capture(SensitivityClass::Prompts));
+    }
+
+    #[test]
+    fn tier_structured_keeps_structured_tier_on() {
+        // `--tier structured` keeps the structured tier (and thus the prompts
+        // lanes) on in the resolved policy, without forcing the prompts class
+        // bit (that stays at the layered recorder-on default).
+        let outdir = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let mut a = agent_args(outdir.path().to_path_buf(), vec!["/bin/sh".into()]);
+        a.tier = Some("structured".into());
+        let policy = resolve_agent_policy(&a, project.path(), outdir.path());
+        assert!(policy.tiers.structured, "--tier structured keeps the structured tier on");
+        assert!(policy.should_capture(SensitivityClass::Prompts));
+    }
+
+    #[test]
+    fn tier_complete_rejected_with_phase4_message() {
+        // MEDIUM-fix regression: `--tier complete` still errors, and the message
+        // now names the complete tier + Phase 4 (NOT the stale "Phase 2" text).
+        let outdir = tempfile::tempdir().unwrap();
+        let mut a = agent_args(outdir.path().to_path_buf(), vec!["/bin/sh".into()]);
+        a.tier = Some("complete".into());
+        let err = a.reject_unsupported_flags().unwrap_err();
+        assert!(matches!(
+            err,
+            crate::error::InventoryError::UnsupportedFlag { .. }
+        ));
+        let msg = err.to_string();
+        assert!(
+            msg.contains("complete tier") && msg.contains("Phase 4"),
+            "corrected message must name the complete tier + Phase 4: {msg}"
+        );
+        assert!(
+            !msg.contains("Phase 2"),
+            "stale 'Phase 2' wording must be gone: {msg}"
+        );
     }
 
     #[test]
@@ -680,6 +913,31 @@ mod tests {
         let text = String::from_utf8(buf).unwrap();
         assert!(text.contains("agent session recorded"));
         // Confirm a row landed.
+        let store = Store::open_in_dir(outdir.path()).unwrap();
+        assert_eq!(
+            store_ext::count_rows(&store, store_ext::InventoryTable::AgentSessions).unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn agent_wrapper_accepts_capture_prompts_and_structured_tier() {
+        // Phase 2 regression: `--capture-prompts` + `--tier structured` must no
+        // longer abort the run (they were rejected in Phase 1). The session is
+        // recorded end-to-end with the structured tier accepted.
+        let outdir = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        init_repo(project.path());
+        let mut args = agent_args(
+            outdir.path().to_path_buf(),
+            vec!["/bin/sh".into(), "-c".into(), "true".into()],
+        );
+        args.capture_prompts = true;
+        args.tier = Some("structured".into());
+        let mut buf = Vec::new();
+        // Would have returned Err(UnsupportedFlag) before Phase 2; now Ok.
+        run_agent_wrapper_in(&args, project.path().to_path_buf(), &mut buf).unwrap();
+        assert!(String::from_utf8(buf).unwrap().contains("agent session recorded"));
         let store = Store::open_in_dir(outdir.path()).unwrap();
         assert_eq!(
             store_ext::count_rows(&store, store_ext::InventoryTable::AgentSessions).unwrap(),

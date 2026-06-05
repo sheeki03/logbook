@@ -7,8 +7,10 @@
 
 pub mod debug;
 pub mod export;
+pub mod hooks;
 pub mod inventory;
 pub mod mcp;
+pub mod proxy;
 pub mod run;
 pub mod security;
 pub mod ui;

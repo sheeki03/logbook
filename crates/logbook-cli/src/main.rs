@@ -8,6 +8,7 @@
 //! |---------------------|----------------------|
 //! | `run` / `tail`      | `logbook-capture`   |
 //! | `mcp`               | `logbook-mcp`       |
+//! | `proxy` / `hooks`   | `logbook-collector` |
 //! | `ui`                | `logbook-ui`        |
 //! | `agent`,`inventory` | `logbook-inventory` |
 //! | `debug`             | `logbook-debug`     |
@@ -38,8 +39,8 @@ use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
 use logbook_inventory::cli::{AgentArgs, InventoryArgs};
 
-use commands::{debug as debug_cmd, export as export_cmd, mcp as mcp_cmd, run as run_cmd,
-    security as security_cmd, ui as ui_cmd};
+use commands::{debug as debug_cmd, export as export_cmd, hooks as hooks_cmd, mcp as mcp_cmd,
+    proxy as proxy_cmd, run as run_cmd, security as security_cmd, ui as ui_cmd};
 
 /// Local-first observability plane for agent-built software.
 #[derive(Debug, Parser)]
@@ -68,6 +69,15 @@ enum Command {
 
     /// Serve the MCP tool surface over stdio (read-only by default).
     Mcp(mcp_cmd::McpArgs),
+
+    /// Run a recording proxy-in-the-middle (`proxy mcp -- <real-server...>`):
+    /// relay an agent's stdio MCP through logbook, recording redacted tool
+    /// events (Phase 2).
+    Proxy(proxy_cmd::ProxyArgs),
+
+    /// Run the collector's harness **hook receiver** (`POST /v1/hooks` +
+    /// `/v1/traces`) and print how to point a harness at it (Phase 2).
+    Hooks(hooks_cmd::HooksArgs),
 
     /// Serve the embedded web UI (timeline + inventory tabs) over loopback.
     Ui(ui_cmd::UiArgs),
@@ -125,6 +135,8 @@ fn dispatch(command: Command) -> anyhow::Result<i32> {
         Command::Run(args) => run_cmd::run(args),
         Command::Tail(args) => run_cmd::tail(args),
         Command::Mcp(args) => mcp_cmd::run(args),
+        Command::Proxy(args) => proxy_cmd::run(args),
+        Command::Hooks(args) => hooks_cmd::run(args),
         Command::Ui(args) => ui_cmd::run(args),
         Command::Agent(args) => commands::inventory::agent(&args),
         Command::Inventory(args) => commands::inventory::inventory(&args),
