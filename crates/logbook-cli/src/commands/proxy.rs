@@ -49,7 +49,7 @@ use clap::{Args, Subcommand};
 use logbook_collector::{run_mcp_proxy, McpProxyConfig};
 use logbook_core::{CapturePolicy, CliOverlay, Redactor, SessionId, TraceId};
 use logbook_harness::harness_context;
-use logbook_llmproxy::{run_llm_proxy, LlmProxyConfig, LlmProxyError, Provider, TokenMode};
+use logbook_llmproxy::{run_llm_proxy, LlmProxyConfig, LlmProxyError, Provider, TokenMode, WireApi};
 use logbook_store::Store;
 
 /// `logbook proxy <kind>` — recording man-in-the-middle proxies.
@@ -265,6 +265,15 @@ pub struct LlmProxyArgs {
     #[arg(long)]
     pub upstream: Option<String>,
 
+    /// Force the OpenAI **wire shape** the recorder parses: `chat` (Chat
+    /// Completions — `/v1/chat/completions`) or `responses` (the Responses API —
+    /// `/v1/responses`, used by Codex and newer clients). Omit to **auto-detect**
+    /// per request by the request path (then a response-shape sniff). The relay
+    /// is byte-exact regardless; this only selects how the recorded copy's model
+    /// / tokens / finish / output text are parsed.
+    #[arg(long, value_enum)]
+    pub wire_api: Option<WireApiArg>,
+
     /// Out-dir holding the logbook store (`<out_dir>/logbook.db`) that recorded
     /// LLM events are written to.
     #[arg(long, default_value = super::DEFAULT_OUT_DIR)]
@@ -329,6 +338,28 @@ impl ProviderArg {
         match self {
             ProviderArg::Anthropic => Provider::Anthropic,
             ProviderArg::Openai => Provider::OpenAi,
+        }
+    }
+}
+
+/// `--wire-api` choices (a CLI mirror of the lane-forcing subset of
+/// [`WireApi`]; omitting the flag maps to [`WireApi::Auto`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum WireApiArg {
+    /// Force the Chat Completions parser (`/v1/chat/completions`).
+    Chat,
+    /// Force the Responses-API parser (`/v1/responses`).
+    Responses,
+}
+
+impl WireApiArg {
+    /// Map an optional `--wire-api` flag to the library [`WireApi`]; `None`
+    /// (flag omitted) is [`WireApi::Auto`] (per-request auto-detection).
+    fn to_wire_api(opt: Option<Self>) -> WireApi {
+        match opt {
+            None => WireApi::Auto,
+            Some(WireApiArg::Chat) => WireApi::Chat,
+            Some(WireApiArg::Responses) => WireApi::Responses,
         }
     }
 }
@@ -417,7 +448,10 @@ fn run_llm(args: LlmProxyArgs) -> anyhow::Result<i32> {
     let mut config = LlmProxyConfig::single(provider, base_url.clone())
         .with_port(args.port)
         .with_token_mode(token_mode)
-        .with_capture_policy(policy);
+        .with_capture_policy(policy)
+        // Force the recorder's wire shape if `--wire-api` was given, else leave it
+        // on auto-detect (by request path, then response shape).
+        .with_wire_api(WireApiArg::to_wire_api(args.wire_api));
     if args.no_redact {
         config = config.without_redaction();
     }
@@ -589,6 +623,18 @@ fn print_llm_instructions(
              are force-redacted regardless, but non-secret payload text may be persisted."
         );
     }
+    // Correlation hint: the proxy already adopts an incoming `x-logbook-trace`
+    // header as the recorded event's trace_id (see record::request_trace), so an
+    // agent that forwards its session trace on that header lands its proxy LLM
+    // events under the same trace as its `logbook agent` session. This is just a
+    // printed tip — it changes no correlation code.
+    println!();
+    println!(
+        "Tip: to correlate these proxy LLM events with a `logbook agent` session, have the\n\
+         agent forward its trace on the `x-logbook-trace` header (the proxy records it as the\n\
+         event's trace_id). For Claude Code:\n  \
+         export ANTHROPIC_CUSTOM_HEADERS=\"x-logbook-trace: $LOGBOOK_TRACE\""
+    );
     println!();
     println!("Press Ctrl-C to stop.");
 }
@@ -729,6 +775,9 @@ mod tests {
         let l = parse_llm(&["x", "proxy", "llm"]);
         assert_eq!(l.provider, ProviderArg::Anthropic);
         assert!(l.upstream.is_none());
+        // No `--wire-api` ⇒ auto-detect (mapped to WireApi::Auto downstream).
+        assert!(l.wire_api.is_none());
+        assert_eq!(WireApiArg::to_wire_api(l.wire_api), WireApi::Auto);
         assert_eq!(l.out_dir, PathBuf::from(super::super::DEFAULT_OUT_DIR));
         assert_eq!(l.root, PathBuf::from("."));
         assert_eq!(l.port, 0);
@@ -743,11 +792,13 @@ mod tests {
     fn parses_proxy_llm_opts() {
         let l = parse_llm(&[
             "x", "proxy", "llm", "--provider", "openai", "--upstream",
-            "https://gateway.example/v1", "--out-dir", "/tmp/o", "--root", "/repo", "--port",
-            "9100", "--yes", "--no-redact", "--no-token", "--audit",
+            "https://gateway.example/v1", "--wire-api", "responses", "--out-dir", "/tmp/o",
+            "--root", "/repo", "--port", "9100", "--yes", "--no-redact", "--no-token", "--audit",
         ]);
         assert_eq!(l.provider, ProviderArg::Openai);
         assert_eq!(l.upstream.as_deref(), Some("https://gateway.example/v1"));
+        assert_eq!(l.wire_api, Some(WireApiArg::Responses));
+        assert_eq!(WireApiArg::to_wire_api(l.wire_api), WireApi::Responses);
         assert_eq!(l.out_dir, PathBuf::from("/tmp/o"));
         assert_eq!(l.root, PathBuf::from("/repo"));
         assert_eq!(l.port, 9100);
@@ -765,6 +816,22 @@ mod tests {
         assert!(cli.is_err(), "unknown --provider must be rejected at parse time");
     }
 
+    #[test]
+    fn proxy_llm_parses_and_maps_wire_api() {
+        // `--wire-api chat` parses and maps to the library lane...
+        let l = parse_llm(&["x", "proxy", "llm", "--wire-api", "chat"]);
+        assert_eq!(l.wire_api, Some(WireApiArg::Chat));
+        assert_eq!(WireApiArg::to_wire_api(l.wire_api), WireApi::Chat);
+        // ...`responses` likewise...
+        let l = parse_llm(&["x", "proxy", "llm", "--wire-api", "responses"]);
+        assert_eq!(WireApiArg::to_wire_api(l.wire_api), WireApi::Responses);
+        // ...omitting the flag is auto-detect...
+        assert_eq!(WireApiArg::to_wire_api(None), WireApi::Auto);
+        // ...and an unknown value is rejected at parse time.
+        let cli = TestCli::try_parse_from(["x", "proxy", "llm", "--wire-api", "grpc"]);
+        assert!(cli.is_err(), "unknown --wire-api must be rejected at parse time");
+    }
+
     /// The headline Phase-4 safety gate: `proxy llm` WITHOUT `--yes` must refuse.
     /// It declines cleanly (exit 2) **before** opening the store, building the
     /// upstream client, or binding a port — so the refusal path makes no network
@@ -777,6 +844,7 @@ mod tests {
         let args = LlmProxyArgs {
             provider: ProviderArg::Anthropic,
             upstream: None,
+            wire_api: None,
             out_dir: out.path().to_path_buf(),
             root: root.path().to_path_buf(),
             port: 0,

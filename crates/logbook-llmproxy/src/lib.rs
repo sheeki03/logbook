@@ -79,8 +79,39 @@ pub const ENV_TOKEN_VAR: &str = "LOGBOOK_LLMPROXY_TOKEN";
 pub enum Provider {
     /// Anthropic Messages API (`/v1/messages`; `x-api-key`).
     Anthropic,
-    /// OpenAI Chat Completions API (`/v1/chat/completions`; bearer key).
+    /// OpenAI (bearer key). Both the **Chat Completions** (`/v1/chat/completions`)
+    /// and **Responses** (`/v1/responses`) wire shapes route here; the recorder
+    /// picks the parser per request (see [`WireApi`]).
     OpenAi,
+}
+
+/// Which OpenAI *wire shape* a forwarded call uses, i.e. which parser the
+/// recording path applies to the request/response. Anthropic has a single shape
+/// (Messages) so this only differentiates the two OpenAI surfaces, but the lane
+/// is resolved uniformly for every provider.
+///
+/// - [`WireApi::Chat`] — the **Chat Completions** shape
+///   (`POST /v1/chat/completions`; response `choices[].message.content`;
+///   `usage.prompt_tokens`/`completion_tokens`).
+/// - [`WireApi::Responses`] — the **Responses** shape (`POST /v1/responses`;
+///   request `input` + `instructions`; response `output[]` items with
+///   `output_text` parts; `usage.input_tokens`/`output_tokens`; `status` /
+///   `incomplete_details`). Codex and newer clients use this.
+/// - [`WireApi::Auto`] (the default) — pick the parser per request: by the
+///   request **path** first (`/v1/responses` ⇒ Responses; `/v1/chat/completions`
+///   ⇒ Chat), then a response **shape sniff** when the path is unrecognized.
+///
+/// The relay is byte-exact regardless; this only selects how the **recorded**
+/// copy is parsed for model / tokens / finish / output text.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum WireApi {
+    /// Auto-detect the lane per request (path first, then response shape).
+    #[default]
+    Auto,
+    /// Force the Chat Completions parser.
+    Chat,
+    /// Force the Responses-API parser.
+    Responses,
 }
 
 impl Provider {
@@ -194,6 +225,11 @@ pub struct LlmProxyConfig {
     /// proxy refuses to start. Prompt/result body capture is further gated by the
     /// `prompts` / `tool_results` classes here.
     pub capture_policy: CapturePolicy,
+    /// Which OpenAI wire shape the **recording** path parses. Defaults to
+    /// [`WireApi::Auto`] (detect per request by path, then response shape);
+    /// [`WireApi::Chat`] / [`WireApi::Responses`] force the lane (the
+    /// `--wire-api` CLI flag). The relay is byte-exact regardless.
+    pub wire_api: WireApi,
 }
 
 impl LlmProxyConfig {
@@ -219,6 +255,7 @@ impl LlmProxyConfig {
             redact: true,
             audit: false,
             capture_policy: CapturePolicy::default(),
+            wire_api: WireApi::default(),
         }
     }
 
@@ -235,6 +272,7 @@ impl LlmProxyConfig {
             redact: true,
             audit: false,
             capture_policy: CapturePolicy::default(),
+            wire_api: WireApi::default(),
         }
     }
 
@@ -264,6 +302,15 @@ impl LlmProxyConfig {
     #[must_use]
     pub fn with_capture_policy(mut self, policy: CapturePolicy) -> Self {
         self.capture_policy = policy;
+        self
+    }
+
+    /// Force the recording-path wire shape (builder-style). Defaults to
+    /// [`WireApi::Auto`] (per-request detection); use [`WireApi::Chat`] /
+    /// [`WireApi::Responses`] to pin the lane (the `--wire-api` CLI flag).
+    #[must_use]
+    pub fn with_wire_api(mut self, wire_api: WireApi) -> Self {
+        self.wire_api = wire_api;
         self
     }
 
@@ -472,6 +519,17 @@ mod tests {
     fn provider_as_str_is_stable() {
         assert_eq!(Provider::Anthropic.as_str(), "anthropic");
         assert_eq!(Provider::OpenAi.as_str(), "openai");
+    }
+
+    #[test]
+    fn wire_api_defaults_to_auto_and_is_overridable() {
+        // The config defaults to auto-detection...
+        let cfg = LlmProxyConfig::single(Provider::OpenAi, "https://api.openai.com");
+        assert_eq!(cfg.wire_api, WireApi::Auto);
+        assert_eq!(WireApi::default(), WireApi::Auto);
+        // ...and the builder pins the lane.
+        let forced = cfg.with_wire_api(WireApi::Responses);
+        assert_eq!(forced.wire_api, WireApi::Responses);
     }
 
     #[test]

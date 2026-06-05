@@ -348,6 +348,11 @@ async fn proxy(
         &ctx,
         RecordInputs {
             provider,
+            // Which wire shape to parse the recorded copy as. The handler knows
+            // the (provider-prefix-stripped) request path on `req`, so even in
+            // `WireApi::Auto` the recorder can detect `/v1/responses` vs
+            // `/v1/chat/completions`; a `--wire-api` override pins the lane.
+            wire_api: state.config.wire_api,
             request: &req,
             response: &upstream_resp,
             price,

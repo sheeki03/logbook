@@ -16,7 +16,11 @@
 //!   intact);
 //! - the proxy is **bearer-gated** (401 without the token) and the mock never
 //!   sees an unauthorized request;
-//! - the real upstream bytes are **relayed unchanged** to the client.
+//! - the real upstream bytes are **relayed unchanged** to the client;
+//! - an OpenAI **Responses API** (`/v1/responses`) call is recorded with the
+//!   Responses parser (model + `input_tokens`/`output_tokens` + `status` +
+//!   concatenated `output_text`), both via path auto-detection and a forced
+//!   `--wire-api responses` lane.
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
@@ -26,7 +30,7 @@ use async_trait::async_trait;
 use logbook_core::{CapturePolicy, Kind};
 use logbook_llmproxy::{
     start_with_upstream, LlmProxyConfig, LlmProxyError, Provider, RunningProxy, TokenMode,
-    Upstream, UpstreamRequest, UpstreamResponse,
+    Upstream, UpstreamRequest, UpstreamResponse, WireApi,
 };
 use logbook_store::{Query, Store};
 
@@ -391,5 +395,108 @@ async fn health_is_public() {
     assert_eq!(resp.status(), 200);
     let body: serde_json::Value = resp.json().await.unwrap();
     assert_eq!(body["ok"], serde_json::json!(true));
+    proxy.shutdown().await;
+}
+
+#[tokio::test]
+async fn responses_api_call_is_recorded_via_path_autodetection() {
+    // End-to-end through the real handler: a POST to `/v1/responses` (the Codex /
+    // Responses-API surface) must be recorded with the Responses parser even with
+    // wire_api left on Auto, because the handler threads the request path into the
+    // recorder. The buffered body uses the Responses shape: `output[]` output_text
+    // parts + `usage.input_tokens`/`output_tokens` + `status:"completed"`.
+    let body = br#"{
+        "id": "resp_1",
+        "model": "gpt-4.1-mini",
+        "status": "completed",
+        "output": [
+            {"type":"message","role":"assistant","content":[
+                {"type":"output_text","text":"two plus two is four"}
+            ]}
+        ],
+        "usage": {"input_tokens": 31, "output_tokens": 6}
+    }"#;
+    let upstream = MockUpstream::new(json_response(200, body));
+    let (proxy, store) = start_proxy(openai_complete_config(), upstream.clone()).await;
+
+    let url = format!("http://127.0.0.1:{}/v1/responses", proxy.port());
+    let resp = reqwest::Client::new()
+        .post(&url)
+        .header("x-logbook-proxy-token", "test-token")
+        .bearer_auth("sk-openai-secret-key")
+        // A secret planted in `input`; it must be recorded (from input) AND redacted.
+        .json(&serde_json::json!({
+            "model": "gpt-4.1-mini",
+            "instructions": "be terse",
+            "input": "what is 2+2? token AKIAIOSFODNN7EXAMPLE"
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    // Forwarded to the right path with the provider key preserved.
+    let fwd = upstream.taken_request().expect("upstream received the request");
+    assert_eq!(fwd.path_and_query, "/v1/responses");
+    assert_eq!(
+        fwd.headers.get("authorization").map(String::as_str),
+        Some("Bearer sk-openai-secret-key")
+    );
+
+    let events = store.query(&Query::new()).unwrap();
+    assert_eq!(events.len(), 1, "one llm event recorded");
+    let ev = &events[0];
+    let llm = ev.blocks.llm.as_ref().unwrap();
+    assert_eq!(llm.provider.as_deref(), Some("openai"));
+    assert_eq!(llm.model.as_deref(), Some("gpt-4.1-mini"));
+    // Responses usage: input_tokens/output_tokens (NOT prompt/completion).
+    assert_eq!(llm.input_tokens, Some(31));
+    assert_eq!(llm.output_tokens, Some(6));
+    assert_eq!(llm.total_tokens, Some(37));
+    assert_eq!(llm.finish_reason.as_deref(), Some("completed"));
+
+    // The recorded response body is the readable concatenated output text.
+    let out = ev.output.as_ref().expect("response captured").as_str().unwrap();
+    assert_eq!(out, "two plus two is four");
+
+    // The recorded prompt is taken from `input` and REDACTED.
+    let prompt = ev.input.as_ref().expect("prompt captured").as_str().unwrap();
+    assert!(prompt.contains("what is 2+2?"), "input prompt lost: {prompt}");
+    assert!(!prompt.contains("AKIAIOSFODNN7EXAMPLE"), "secret leaked: {prompt}");
+    assert!(prompt.contains("REDACTED:CLOUD_KEY:"), "no redaction marker: {prompt}");
+
+    proxy.shutdown().await;
+}
+
+#[tokio::test]
+async fn forced_wire_api_responses_parses_unprefixed_path() {
+    // With the lane FORCED to Responses (the `--wire-api responses` case), a
+    // buffered Responses body is parsed regardless of the request path.
+    let body = br#"{"model":"gpt-4.1","status":"completed","output":[{"type":"message","content":[{"type":"output_text","text":"ok"}]}],"usage":{"input_tokens":4,"output_tokens":2}}"#;
+    let config = LlmProxyConfig::single(Provider::OpenAi, "https://openai.example")
+        .with_port(0)
+        .with_token_mode(TokenMode::Fixed("test-token".into()))
+        .with_complete_tier()
+        .with_wire_api(WireApi::Responses);
+    let upstream = MockUpstream::new(json_response(200, body));
+    let (proxy, store) = start_proxy(config, upstream).await;
+
+    // Note the non-Responses path: the forced lane still applies the Responses parser.
+    let url = format!("http://127.0.0.1:{}/v1/chat/completions", proxy.port());
+    let resp = reqwest::Client::new()
+        .post(&url)
+        .header("x-logbook-proxy-token", "test-token")
+        .json(&serde_json::json!({"model": "gpt-4.1", "input": "hi"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let events = store.query(&Query::new()).unwrap();
+    let llm = events[0].blocks.llm.as_ref().unwrap();
+    assert_eq!(llm.input_tokens, Some(4), "forced Responses lane must parse input_tokens");
+    assert_eq!(llm.output_tokens, Some(2));
+    assert_eq!(events[0].output.as_ref().unwrap().as_str().unwrap(), "ok");
+
     proxy.shutdown().await;
 }

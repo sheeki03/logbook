@@ -28,7 +28,7 @@ use logbook_core::{Category, Event, Kind, LlmBlock, MicrosTimestamp, Sensitivity
 use logbook_harness::HarnessContext;
 
 use crate::upstream::{UpstreamRequest, UpstreamResponse};
-use crate::{ModelPrice, Provider};
+use crate::{ModelPrice, Provider, WireApi};
 
 /// Inputs to [`record_llm_event`]: the provider, the forwarded request, the
 /// reassembled response, and the optional per-1M-token price for cost
@@ -36,6 +36,10 @@ use crate::{ModelPrice, Provider};
 pub struct RecordInputs<'a> {
     /// Which provider this call went to (sets `LlmBlock.provider`).
     pub provider: Provider,
+    /// Which OpenAI wire shape to parse with. [`WireApi::Auto`] detects per
+    /// request (by [`UpstreamRequest::path_and_query`] first, then the response
+    /// shape); [`WireApi::Chat`] / [`WireApi::Responses`] force the lane.
+    pub wire_api: WireApi,
     /// The forwarded request (its body is the prompt — redacted + gated here).
     pub request: &'a UpstreamRequest,
     /// The reassembled upstream response (its body is the completion — redacted
@@ -138,9 +142,12 @@ struct CompletionMeta {
     input_tokens: Option<u64>,
     output_tokens: Option<u64>,
     finish_reason: Option<String>,
-    /// The reassembled completion text (for streaming responses) — used as the
-    /// recorded response body when no full JSON body is available. Already plain
-    /// text; still force-redacted before persistence.
+    /// The completion text to record as the response body, when the parser can
+    /// extract a clean one: the reassembled deltas of a streaming response, or
+    /// the concatenated `output_text` of a buffered **Responses** body. When
+    /// `None` (e.g. a buffered Chat/Anthropic body), the recorder falls back to
+    /// the whole decoded body. Already plain text; still force-redacted before
+    /// persistence.
     reassembled_text: Option<String>,
 }
 
@@ -155,6 +162,7 @@ struct CompletionMeta {
 pub fn record_llm_event(ctx: &HarnessContext, inputs: RecordInputs<'_>) -> Event {
     let RecordInputs {
         provider,
+        wire_api,
         request,
         response,
         price,
@@ -171,12 +179,17 @@ pub fn record_llm_event(ctx: &HarnessContext, inputs: RecordInputs<'_>) -> Event
     // the recording path reads from the body (SSE reassembly, JSON usage parsing,
     // the stored `output` text) must run over the DECODED bytes, not `response.body`.
     let body = decoded_body(response);
-    // The parser choice, however, is driven by the RESPONSE shape only: a client
-    // can ask for `stream:true` and still receive a buffered JSON body (the
+    // Resolve the wire shape ONCE (forced lane, else auto-detect by the request
+    // PATH, else a response shape sniff) and drive BOTH the response parser and
+    // the prompt extraction from it, so a single call is parsed consistently end
+    // to end. See [`resolve_wire_api`] for the precedence.
+    let resolved = resolve_wire_api(wire_api, request, response, &body);
+    // The streaming-vs-buffered parser choice is driven by the RESPONSE shape: a
+    // client can ask for `stream:true` and still receive a buffered JSON body (the
     // provider ignored the flag, or it's a 4xx/5xx JSON error body). Keying the
-    // reassembly off `request.wants_stream()` would run `reassemble_sse` on that
+    // reassembly off `request.wants_stream()` would run the SSE reassembler on that
     // JSON, find no `data:` lines, and silently drop tokens/finish-reason/cost.
-    let meta = extract_completion_meta(response, &body);
+    let meta = extract_completion_meta(resolved, response, &body);
 
     // Model: prefer the response's reported model, fall back to the request's.
     let model = meta
@@ -242,7 +255,10 @@ pub fn record_llm_event(ctx: &HarnessContext, inputs: RecordInputs<'_>) -> Event
     // ---- Prompt body (request) — gated by the `prompts` class, force-redacted.
     if ctx.captures(SensitivityClass::Prompts) {
         if !request.body.is_empty() {
-            let raw = String::from_utf8_lossy(&request.body);
+            // For the Responses lane the prompt lives in `input` (stringify an
+            // array of input items); the Chat / Anthropic lanes record the whole
+            // request body as today. Either way it is redacted + gated below.
+            let raw = request_prompt_text(resolved, request);
             let (redacted, truncated) = ctx.redact_text(SensitivityClass::Prompts, &raw);
             event.input = Some(serde_json::Value::String(redacted));
             if truncated {
@@ -287,11 +303,13 @@ pub fn record_llm_event(ctx: &HarnessContext, inputs: RecordInputs<'_>) -> Event
     event
 }
 
-/// The text to record as the response body: the reassembled completion text for
-/// a streamed response, otherwise the (decoded) buffered body as text. `body` is
-/// the already-`Content-Encoding`-decoded response bytes (see [`decoded_body`]),
-/// so the recorded `output` is readable text, not gzip garbage. Returns `None`
-/// for an empty body. **Always** redacted by the caller before use.
+/// The text to record as the response body: the parser-extracted completion
+/// text when present (reassembled streaming deltas, or a buffered **Responses**
+/// body's concatenated `output_text`), otherwise the (decoded) buffered body as
+/// text — which is the path for a buffered Chat/Anthropic body. `body` is the
+/// already-`Content-Encoding`-decoded response bytes (see [`decoded_body`]), so
+/// the recorded `output` is readable text, not gzip garbage. Returns `None` for
+/// an empty body. **Always** redacted by the caller before use.
 fn response_body_text(body: &[u8], meta: &CompletionMeta) -> Option<String> {
     if let Some(text) = &meta.reassembled_text {
         if !text.is_empty() {
@@ -378,28 +396,150 @@ fn derive_cost(price: Option<ModelPrice>, input: Option<u64>, output: Option<u64
     Some((i * price.input_per_mtok + o * price.output_per_mtok) / 1_000_000.0)
 }
 
+/// The wire shape the recording path has *resolved* to for a single call — the
+/// concrete lane [`extract_completion_meta`] / [`request_prompt_text`] parse
+/// against, after [`WireApi::Auto`] has been collapsed to one of these.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ResolvedWireApi {
+    /// OpenAI Chat Completions / Anthropic Messages (the existing parsers).
+    Chat,
+    /// OpenAI Responses API.
+    Responses,
+}
+
+/// Resolve which parser to apply to one call.
+///
+/// Precedence (per the plan):
+/// 1. A **forced** lane ([`WireApi::Chat`] / [`WireApi::Responses`]) always wins
+///    (the `--wire-api` flag).
+/// 2. [`WireApi::Auto`]: detect by the **request path**
+///    ([`UpstreamRequest::path_and_query`], already provider-prefix-stripped) —
+///    `/v1/responses` or `/responses` ⇒ Responses; `/v1/chat/completions` or
+///    `/chat/completions` ⇒ Chat.
+/// 3. Still ambiguous (an unrecognized path): **sniff the response shape** —
+///    a buffered JSON body with a top-level `output` array **and**
+///    `usage.input_tokens` ⇒ Responses; one with `choices` ⇒ Chat; for an event
+///    stream, any `response.*`-typed SSE event ⇒ Responses. Default: Chat (the
+///    historical behavior, so nothing regresses when the signal is absent).
+fn resolve_wire_api(
+    forced: WireApi,
+    request: &UpstreamRequest,
+    response: &UpstreamResponse,
+    body: &[u8],
+) -> ResolvedWireApi {
+    match forced {
+        WireApi::Chat => return ResolvedWireApi::Chat,
+        WireApi::Responses => return ResolvedWireApi::Responses,
+        WireApi::Auto => {}
+    }
+
+    // 2. Path-based detection (the primary auto signal; works for streams too,
+    //    since the path is known regardless of streaming).
+    if let Some(lane) = wire_api_from_path(&request.path_and_query) {
+        return lane;
+    }
+
+    // 3. Fall back to a response shape sniff (Chat is the default when no
+    //    Responses signal is present, so nothing regresses).
+    let looks_like_responses = if response.is_event_stream() {
+        sse_looks_like_responses(body)
+    } else {
+        body_json(body).is_some_and(|json| json_looks_like_responses(&json))
+    };
+    if looks_like_responses {
+        ResolvedWireApi::Responses
+    } else {
+        ResolvedWireApi::Chat
+    }
+}
+
+/// Auto-detect the lane from a request path (query string ignored). Matches the
+/// two known Responses paths (`/v1/responses`, `/responses`) and the two Chat
+/// paths (`/v1/chat/completions`, `/chat/completions`); anything else is `None`
+/// so the caller falls back to a shape sniff.
+fn wire_api_from_path(path_and_query: &str) -> Option<ResolvedWireApi> {
+    let path = path_and_query
+        .split(['?', '#'])
+        .next()
+        .unwrap_or(path_and_query)
+        .trim_end_matches('/');
+    match path {
+        "/v1/responses" | "/responses" => Some(ResolvedWireApi::Responses),
+        "/v1/chat/completions" | "/chat/completions" => Some(ResolvedWireApi::Chat),
+        _ => None,
+    }
+}
+
+/// Shape sniff for a buffered JSON body: a Responses body has a top-level
+/// `output` array **and** `usage.input_tokens`. (Chat has `choices`; Anthropic
+/// has `content` + `input_tokens` but no `output` array — so requiring the
+/// `output` array keeps the two apart.)
+fn json_looks_like_responses(json: &serde_json::Value) -> bool {
+    let has_output_array = json.get("output").map(serde_json::Value::is_array) == Some(true);
+    let has_input_tokens = json
+        .get("usage")
+        .and_then(|u| u.get("input_tokens"))
+        .is_some();
+    has_output_array && has_input_tokens
+}
+
+/// Shape sniff for an SSE stream: any `data:` event whose `type` starts with
+/// `response.` (e.g. `response.output_text.delta`, `response.completed`) marks
+/// the Responses streaming shape. Scans only until the first match.
+fn sse_looks_like_responses(body: &[u8]) -> bool {
+    let text = String::from_utf8_lossy(body);
+    for line in text.lines() {
+        let line = line.trim_end_matches('\r');
+        let Some(data) = line.strip_prefix("data:") else {
+            continue;
+        };
+        let data = data.trim();
+        if data.is_empty() || data == "[DONE]" {
+            continue;
+        }
+        if let Ok(json) = serde_json::from_str::<serde_json::Value>(data) {
+            if json
+                .get("type")
+                .and_then(|v| v.as_str())
+                .is_some_and(|t| t.starts_with("response."))
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// Extract provider-agnostic completion metadata from a response.
 ///
 /// `body` is the already-`Content-Encoding`-decoded response body (see
 /// [`decoded_body`]) — a gzipped stream is the WHOLE SSE stream compressed, so it
-/// must be decoded BEFORE we reassemble, otherwise `reassemble_sse` sees binary
+/// must be decoded BEFORE we reassemble, otherwise the SSE reassembler sees binary
 /// and finds no `data:` lines. We parse `body`, not `response.body`.
 ///
-/// The parser is chosen from the **response shape**, never the request: SSE is
-/// reassembled only when the upstream actually replied with an event stream
-/// (`response.is_event_stream()`); otherwise the buffered JSON body is parsed.
-/// This matters because a client can send `stream:true` yet receive a buffered
-/// JSON body — the provider ignored the flag, or it's a 4xx/5xx JSON error body.
-/// Reassembling SSE over that JSON would find no `data:` lines and return a
-/// default (empty) meta, silently dropping the tokens/finish-reason/cost that
-/// are sitting right there in the body.
-fn extract_completion_meta(response: &UpstreamResponse, body: &[u8]) -> CompletionMeta {
-    if response.is_event_stream() {
-        reassemble_sse(body)
-    } else if let Some(json) = body_json(body) {
-        meta_from_json(&json)
-    } else {
-        CompletionMeta::default()
+/// `resolved` is the lane chosen by [`resolve_wire_api`] (Chat vs Responses). The
+/// streaming-vs-buffered choice is then driven by the **response shape**, never
+/// the request: SSE is reassembled only when the upstream actually replied with an
+/// event stream (`response.is_event_stream()`); otherwise the buffered JSON body
+/// is parsed. This matters because a client can send `stream:true` yet receive a
+/// buffered JSON body — the provider ignored the flag, or it's a 4xx/5xx JSON
+/// error body. Reassembling SSE over that JSON would find no `data:` lines and
+/// return a default (empty) meta, silently dropping the tokens/finish-reason/cost
+/// that are sitting right there in the body.
+fn extract_completion_meta(
+    resolved: ResolvedWireApi,
+    response: &UpstreamResponse,
+    body: &[u8],
+) -> CompletionMeta {
+    match (resolved, response.is_event_stream()) {
+        (ResolvedWireApi::Responses, true) => reassemble_responses_sse(body),
+        (ResolvedWireApi::Responses, false) => body_json(body)
+            .map(|json| meta_from_responses_json(&json))
+            .unwrap_or_default(),
+        (ResolvedWireApi::Chat, true) => reassemble_sse(body),
+        (ResolvedWireApi::Chat, false) => body_json(body)
+            .map(|json| meta_from_json(&json))
+            .unwrap_or_default(),
     }
 }
 
@@ -412,10 +552,11 @@ fn body_json(body: &[u8]) -> Option<serde_json::Value> {
     serde_json::from_slice(body).ok()
 }
 
-/// Pull model / usage / finish-reason out of a buffered JSON completion body,
-/// tolerating both the OpenAI (`usage.prompt_tokens`/`completion_tokens`,
-/// `choices[0].finish_reason`) and Anthropic (`usage.input_tokens`/
-/// `output_tokens`, `stop_reason`) shapes.
+/// Pull model / usage / finish-reason out of a buffered **Chat-Completions /
+/// Anthropic-Messages** JSON body, tolerating both the OpenAI
+/// (`usage.prompt_tokens`/`completion_tokens`, `choices[0].finish_reason`) and
+/// Anthropic (`usage.input_tokens`/`output_tokens`, `stop_reason`) shapes. The
+/// Responses-API body is parsed by [`meta_from_responses_json`] instead.
 fn meta_from_json(json: &serde_json::Value) -> CompletionMeta {
     let mut meta = CompletionMeta {
         model: json.get("model").and_then(|v| v.as_str()).map(str::to_string),
@@ -449,6 +590,97 @@ fn meta_from_json(json: &serde_json::Value) -> CompletionMeta {
 /// non-integer.
 fn u64_field(obj: &serde_json::Value, key: &str) -> Option<u64> {
     obj.get(key).and_then(serde_json::Value::as_u64)
+}
+
+/// Pull model / usage / finish / output-text out of a buffered **Responses-API**
+/// JSON body (`POST /v1/responses`).
+///
+/// Shape (the parts we record):
+/// - `model` — top-level model id.
+/// - usage — `usage.input_tokens` / `usage.output_tokens` (NOT the Chat
+///   `prompt_tokens`/`completion_tokens`).
+/// - finish — `incomplete_details.reason` when the run stopped short (e.g.
+///   `max_output_tokens`), else the run `status` (`completed` / `failed` / …);
+///   the more specific incomplete reason is preferred so a truncated answer is
+///   recorded as *why* it stopped rather than the generic `incomplete`.
+/// - text — the assistant's visible output, concatenated from every
+///   `output_text` part of `output[]` (see [`responses_output_text`]).
+fn meta_from_responses_json(json: &serde_json::Value) -> CompletionMeta {
+    let mut meta = CompletionMeta {
+        model: json.get("model").and_then(|v| v.as_str()).map(str::to_string),
+        ..CompletionMeta::default()
+    };
+
+    if let Some(usage) = json.get("usage") {
+        meta.input_tokens = u64_field(usage, "input_tokens");
+        meta.output_tokens = u64_field(usage, "output_tokens");
+    }
+
+    meta.finish_reason = responses_finish_reason(json);
+
+    let text = responses_output_text(json);
+    if !text.is_empty() {
+        meta.reassembled_text = Some(text);
+    }
+
+    meta
+}
+
+/// The finish/stop signal for a Responses body or a final stream `response`
+/// object: the specific `incomplete_details.reason` if present, else the run
+/// `status` (e.g. `completed`). `None` when neither is present.
+fn responses_finish_reason(response_obj: &serde_json::Value) -> Option<String> {
+    response_obj
+        .get("incomplete_details")
+        .and_then(|d| d.get("reason"))
+        .and_then(|v| v.as_str())
+        .or_else(|| response_obj.get("status").and_then(|v| v.as_str()))
+        .map(str::to_string)
+}
+
+/// Concatenate the assistant's visible text from a Responses `output[]` array.
+///
+/// The Responses output is an array of items; an assistant message item carries
+/// a `content[]` array whose `output_text` parts hold the text in a `text`
+/// field. We walk every `output[]` item and, for robustness against minor shape
+/// differences, accept the text from:
+/// - each `content[]` part whose `type == "output_text"` (the real API shape:
+///   `output[].content[].text`), and
+/// - an `output[]` item that is itself directly `type == "output_text"` with a
+///   top-level `text` (a flattened shape).
+///
+/// Non-text parts (tool calls, reasoning, refusals) are skipped. Returns an empty
+/// string when there is no visible text.
+fn responses_output_text(response_obj: &serde_json::Value) -> String {
+    let Some(items) = response_obj.get("output").and_then(|v| v.as_array()) else {
+        return String::new();
+    };
+    let mut out = String::new();
+    for item in items {
+        // Real shape: message item with a content array of output_text parts.
+        if let Some(parts) = item.get("content").and_then(|v| v.as_array()) {
+            for part in parts {
+                if let Some(t) = output_text_part(part) {
+                    out.push_str(t);
+                }
+            }
+        }
+        // Flattened shape: the item itself is an output_text with a text field.
+        if let Some(t) = output_text_part(item) {
+            out.push_str(t);
+        }
+    }
+    out
+}
+
+/// The `text` of a JSON value iff it is an `output_text` part
+/// (`{"type":"output_text","text":"…"}`); `None` for any other part type or a
+/// missing/non-string text.
+fn output_text_part(part: &serde_json::Value) -> Option<&str> {
+    if part.get("type").and_then(|v| v.as_str()) != Some("output_text") {
+        return None;
+    }
+    part.get("text").and_then(|v| v.as_str())
 }
 
 /// Reassemble a buffered SSE byte stream into one [`CompletionMeta`]: concatenate
@@ -554,6 +786,124 @@ fn reassemble_sse(body: &[u8]) -> CompletionMeta {
     meta
 }
 
+/// Reassemble a buffered **Responses-API** SSE stream (`POST /v1/responses` with
+/// `stream:true`) into one [`CompletionMeta`].
+///
+/// The Responses stream is a sequence of typed events; we use the two that carry
+/// what we record:
+/// - `response.output_text.delta` — incremental visible text in a top-level
+///   `delta` string. We concatenate these so the recorded body is the full
+///   completion text, never an individual chunk.
+/// - `response.completed` / `response.incomplete` (and, defensively,
+///   `response.failed`) — each carries the final `response` object with the
+///   authoritative `usage`, `model`, `status`, and `output[]`. We take
+///   model/usage/finish from it, and if no text deltas were seen we fall back to
+///   the text in its `output[]` (so a stream that only emitted the final object
+///   still records its text).
+///
+/// Same discipline as the Chat SSE path: this runs over the **decoded** body and
+/// is followed by redaction-then-persist in [`record_llm_event`] — raw chunks are
+/// never persisted.
+fn reassemble_responses_sse(body: &[u8]) -> CompletionMeta {
+    let text = String::from_utf8_lossy(body);
+    let mut meta = CompletionMeta::default();
+    let mut buf = String::new();
+    // Text recovered from a final `response` object's `output[]`, used only as a
+    // fallback when no incremental text deltas were seen.
+    let mut final_obj_text: Option<String> = None;
+
+    for line in text.lines() {
+        let line = line.trim_end_matches('\r');
+        let Some(data) = line.strip_prefix("data:") else {
+            continue;
+        };
+        let data = data.trim();
+        if data.is_empty() || data == "[DONE]" {
+            continue;
+        }
+        let Ok(json) = serde_json::from_str::<serde_json::Value>(data) else {
+            // A non-JSON data line is not text we can trust to reassemble; skip
+            // it rather than guess (and never persist it raw).
+            continue;
+        };
+
+        let event_type = json.get("type").and_then(|v| v.as_str()).unwrap_or("");
+
+        // Incremental visible text.
+        if event_type == "response.output_text.delta" {
+            if let Some(delta) = json.get("delta").and_then(|v| v.as_str()) {
+                buf.push_str(delta);
+            }
+            continue;
+        }
+
+        // Terminal events carry the final `response` object (with the
+        // authoritative usage/model/status/output). `response.completed`,
+        // `response.incomplete`, and `response.failed` all match this.
+        if let Some(response_obj) = json.get("response") {
+            if let Some(m) = response_obj.get("model").and_then(|v| v.as_str()) {
+                meta.model = Some(m.to_string());
+            }
+            if let Some(usage) = response_obj.get("usage") {
+                if let Some(i) = u64_field(usage, "input_tokens") {
+                    meta.input_tokens = Some(i);
+                }
+                if let Some(o) = u64_field(usage, "output_tokens") {
+                    meta.output_tokens = Some(o);
+                }
+            }
+            if let Some(fr) = responses_finish_reason(response_obj) {
+                meta.finish_reason = Some(fr);
+            }
+            // Fallback text from the final object's output (used only if no
+            // deltas streamed).
+            let t = responses_output_text(response_obj);
+            if !t.is_empty() {
+                final_obj_text = Some(t);
+            }
+        }
+    }
+
+    meta.reassembled_text = if !buf.is_empty() {
+        Some(buf)
+    } else {
+        final_obj_text
+    };
+    meta
+}
+
+/// The text to record as the **prompt** (request body) for the resolved lane.
+///
+/// - [`ResolvedWireApi::Responses`] — the prompt lives in `input` (a string, or
+///   an array of input items). We record the `input`: a string verbatim, an
+///   array (or object) as its compact JSON. If the body has no `input` (or isn't
+///   JSON), we fall back to the whole body so nothing is silently dropped.
+/// - [`ResolvedWireApi::Chat`] — record the whole request body, exactly as the
+///   Chat / Anthropic path always has.
+///
+/// Returns a [`Cow`] so the common Chat path stays zero-copy. The caller redacts
+/// + truncates + gates the result before it ever touches an [`Event`].
+fn request_prompt_text<'a>(resolved: ResolvedWireApi, request: &'a UpstreamRequest) -> Cow<'a, str> {
+    if resolved == ResolvedWireApi::Responses {
+        if let Some(json) = request.body_json() {
+            if let Some(input) = json.get("input") {
+                return Cow::Owned(stringify_input(input));
+            }
+        }
+    }
+    String::from_utf8_lossy(&request.body)
+}
+
+/// Stringify a Responses `input`: a JSON string is returned verbatim; anything
+/// else (the array-of-input-items form, or an object) is rendered as compact
+/// JSON so the recorded prompt is a faithful, redactable, single string.
+fn stringify_input(input: &serde_json::Value) -> String {
+    match input {
+        serde_json::Value::String(s) => s.clone(),
+        other => other.to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -569,6 +919,17 @@ mod tests {
         UpstreamRequest {
             method: "POST".into(),
             path_and_query: "/v1/messages".into(),
+            headers: BTreeMap::new(),
+            body: body.to_vec(),
+        }
+    }
+
+    /// A request at an explicit (provider-prefix-stripped) path, for exercising
+    /// path-based wire-api detection.
+    fn req_at(path: &str, body: &[u8]) -> UpstreamRequest {
+        UpstreamRequest {
+            method: "POST".into(),
+            path_and_query: path.into(),
             headers: BTreeMap::new(),
             body: body.to_vec(),
         }
@@ -715,6 +1076,7 @@ mod tests {
             &ctx,
             RecordInputs {
                 provider: Provider::OpenAi,
+                wire_api: WireApi::Auto,
                 request: &request,
                 response: &response,
                 price: None,
@@ -742,6 +1104,7 @@ mod tests {
             &ctx,
             RecordInputs {
                 provider: Provider::Anthropic,
+                wire_api: WireApi::Auto,
                 request: &request,
                 response: &response,
                 price: None,
@@ -781,6 +1144,7 @@ mod tests {
             &ctx,
             RecordInputs {
                 provider: Provider::OpenAi,
+                wire_api: WireApi::Auto,
                 request: &request,
                 response: &response,
                 price: None,
@@ -816,6 +1180,7 @@ mod tests {
             &ctx,
             RecordInputs {
                 provider: Provider::OpenAi,
+                wire_api: WireApi::Auto,
                 request: &request,
                 response: &response,
                 price: None,
@@ -857,6 +1222,7 @@ mod tests {
             &ctx,
             RecordInputs {
                 provider: Provider::OpenAi,
+                wire_api: WireApi::Auto,
                 request: &request,
                 response: &response,
                 price: Some(price),
@@ -891,6 +1257,7 @@ mod tests {
             &ctx,
             RecordInputs {
                 provider: Provider::OpenAi,
+                wire_api: WireApi::Auto,
                 request: &request,
                 response: &response,
                 price: None,
@@ -923,6 +1290,7 @@ mod tests {
             &ctx,
             RecordInputs {
                 provider: Provider::Anthropic,
+                wire_api: WireApi::Auto,
                 request: &request,
                 response: &response,
                 price: None,
@@ -963,6 +1331,7 @@ mod tests {
             &ctx,
             RecordInputs {
                 provider: Provider::OpenAi,
+                wire_api: WireApi::Auto,
                 request: &request,
                 response: &response,
                 price: None,
@@ -1016,5 +1385,346 @@ mod tests {
         let mut resp = gzip_resp(200, "application/json", b"payload");
         resp.headers.insert("content-encoding".into(), "identity, gzip".into());
         assert_eq!(decoded_body(&resp).as_ref(), &b"payload"[..]);
+    }
+
+    // ---- OpenAI Responses API (`/v1/responses`) ------------------------------
+
+    /// A realistic buffered Responses body: top-level `model`, `status`,
+    /// `usage.input_tokens`/`output_tokens`, and an `output[]` message whose
+    /// `content[]` carries two `output_text` parts (plus a non-text part that
+    /// must be ignored).
+    const RESPONSES_JSON: &[u8] = br#"{
+        "id": "resp_123",
+        "object": "response",
+        "model": "gpt-4.1-mini",
+        "status": "completed",
+        "output": [
+            {
+                "type": "message",
+                "role": "assistant",
+                "content": [
+                    {"type": "output_text", "text": "Hello, "},
+                    {"type": "output_text", "text": "world!"},
+                    {"type": "refusal", "refusal": "n/a"}
+                ]
+            }
+        ],
+        "usage": {"input_tokens": 42, "output_tokens": 9, "total_tokens": 51}
+    }"#;
+
+    #[test]
+    fn meta_from_responses_json_extracts_model_usage_finish_and_text() {
+        let meta = meta_from_responses_json(&serde_json::from_slice(RESPONSES_JSON).unwrap());
+        assert_eq!(meta.model.as_deref(), Some("gpt-4.1-mini"));
+        // Responses usage uses input_tokens/output_tokens (NOT prompt/completion).
+        assert_eq!(meta.input_tokens, Some(42));
+        assert_eq!(meta.output_tokens, Some(9));
+        // finish/status comes from `status` when not incomplete.
+        assert_eq!(meta.finish_reason.as_deref(), Some("completed"));
+        // Visible text is the concatenation of the output_text parts; the refusal
+        // part is skipped.
+        assert_eq!(meta.reassembled_text.as_deref(), Some("Hello, world!"));
+    }
+
+    #[test]
+    fn responses_incomplete_details_reason_preferred_over_status() {
+        // A truncated answer: status is the generic "incomplete" but
+        // incomplete_details.reason ("max_output_tokens") is the precise signal.
+        let body = br#"{
+            "model": "gpt-4.1",
+            "status": "incomplete",
+            "incomplete_details": {"reason": "max_output_tokens"},
+            "output": [{"type":"message","content":[{"type":"output_text","text":"partial"}]}],
+            "usage": {"input_tokens": 10, "output_tokens": 1024}
+        }"#;
+        let meta = meta_from_responses_json(&serde_json::from_slice(body).unwrap());
+        assert_eq!(meta.finish_reason.as_deref(), Some("max_output_tokens"));
+        assert_eq!(meta.output_tokens, Some(1024));
+    }
+
+    #[test]
+    fn responses_buffered_record_has_model_tokens_and_readable_text() {
+        // End-to-end through record_llm_event with the lane FORCED to Responses:
+        // the recorded event carries the model, the input/output tokens, and the
+        // concatenated output text (readable, redacted).
+        let ctx = ctx_with(CapturePolicy::default());
+        let request = req_at("/v1/responses", br#"{"model":"gpt-4.1-mini","input":"hi"}"#);
+        let response = json_resp(200, RESPONSES_JSON);
+        let ev = record_llm_event(
+            &ctx,
+            RecordInputs {
+                provider: Provider::OpenAi,
+                wire_api: WireApi::Responses,
+                request: &request,
+                response: &response,
+                price: None,
+                timestamp: MicrosTimestamp(1),
+                duration_ms: None,
+            },
+        );
+
+        let llm = ev.blocks.llm.as_ref().unwrap();
+        assert_eq!(llm.model.as_deref(), Some("gpt-4.1-mini"));
+        assert_eq!(llm.input_tokens, Some(42));
+        assert_eq!(llm.output_tokens, Some(9));
+        assert_eq!(llm.total_tokens, Some(51));
+        assert_eq!(llm.finish_reason.as_deref(), Some("completed"));
+        // The recorded response body is the readable concatenated output text.
+        let out = ev.output.as_ref().unwrap().as_str().unwrap();
+        assert_eq!(out, "Hello, world!");
+    }
+
+    #[test]
+    fn auto_detection_picks_responses_for_v1_responses_path() {
+        // No forced lane: the request PATH `/v1/responses` selects the Responses
+        // parser, so usage parses as input/output tokens (not dropped).
+        let ctx = ctx_with(CapturePolicy::default());
+        let request = req_at("/v1/responses?store=false", br#"{"model":"gpt-4.1-mini","input":"hi"}"#);
+        let response = json_resp(200, RESPONSES_JSON);
+        let ev = record_llm_event(
+            &ctx,
+            RecordInputs {
+                provider: Provider::OpenAi,
+                wire_api: WireApi::Auto,
+                request: &request,
+                response: &response,
+                price: None,
+                timestamp: MicrosTimestamp(1),
+                duration_ms: None,
+            },
+        );
+        let llm = ev.blocks.llm.as_ref().unwrap();
+        assert_eq!(llm.input_tokens, Some(42), "path-detect must pick Responses");
+        assert_eq!(llm.output_tokens, Some(9));
+        assert_eq!(
+            ev.output.as_ref().unwrap().as_str().unwrap(),
+            "Hello, world!"
+        );
+    }
+
+    #[test]
+    fn auto_detection_picks_chat_for_v1_chat_completions_path() {
+        // The path `/v1/chat/completions` selects the Chat parser even under Auto.
+        assert_eq!(
+            wire_api_from_path("/v1/chat/completions"),
+            Some(ResolvedWireApi::Chat)
+        );
+        assert_eq!(
+            wire_api_from_path("/chat/completions?x=1"),
+            Some(ResolvedWireApi::Chat)
+        );
+        assert_eq!(wire_api_from_path("/v1/responses"), Some(ResolvedWireApi::Responses));
+        assert_eq!(wire_api_from_path("/responses"), Some(ResolvedWireApi::Responses));
+        // An unknown path defers to the shape sniff.
+        assert_eq!(wire_api_from_path("/v1/messages"), None);
+    }
+
+    #[test]
+    fn auto_detection_shape_sniff_falls_back_to_responses_on_unknown_path() {
+        // Unknown path (so path-detect is inconclusive) + a Responses-shaped
+        // buffered body (top-level `output` array AND `usage.input_tokens`) ⇒ the
+        // shape sniff routes it to the Responses parser.
+        let request = req_at("/v1/proxy/passthrough", br#"{}"#);
+        let response = json_resp(200, RESPONSES_JSON);
+        let body = decoded_body(&response);
+        assert_eq!(
+            resolve_wire_api(WireApi::Auto, &request, &response, &body),
+            ResolvedWireApi::Responses
+        );
+        // A chat-shaped body on an unknown path sniffs to Chat (the default).
+        let chat = json_resp(
+            200,
+            br#"{"model":"gpt-4o","choices":[{"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1}}"#,
+        );
+        let chat_body = decoded_body(&chat);
+        assert_eq!(
+            resolve_wire_api(WireApi::Auto, &request, &chat, &chat_body),
+            ResolvedWireApi::Chat
+        );
+    }
+
+    #[test]
+    fn forced_wire_api_overrides_path_detection() {
+        // Forcing Chat on a `/v1/responses` path must use the Chat parser (and so
+        // NOT find the Responses-shaped usage) — proving the flag wins over path.
+        let chat_on_responses_path = req_at("/v1/responses", b"{}");
+        let resp = json_resp(200, RESPONSES_JSON);
+        let body = decoded_body(&resp);
+        assert_eq!(
+            resolve_wire_api(WireApi::Chat, &chat_on_responses_path, &resp, &body),
+            ResolvedWireApi::Chat
+        );
+        // And forcing Responses on a chat path wins the other way.
+        let resp_on_chat_path = req_at("/v1/chat/completions", b"{}");
+        assert_eq!(
+            resolve_wire_api(WireApi::Responses, &resp_on_chat_path, &resp, &body),
+            ResolvedWireApi::Responses
+        );
+    }
+
+    #[test]
+    fn responses_prompt_uses_input_field() {
+        // The recorded prompt for a Responses call is the `input` (string verbatim).
+        let request = req_at(
+            "/v1/responses",
+            br#"{"model":"gpt-4.1","instructions":"be terse","input":"what is 2+2?"}"#,
+        );
+        let text = request_prompt_text(ResolvedWireApi::Responses, &request);
+        assert_eq!(text, "what is 2+2?");
+
+        // An array `input` is stringified to compact JSON (still one redactable
+        // string).
+        let arr = req_at(
+            "/v1/responses",
+            br#"{"input":[{"role":"user","content":"hello"}]}"#,
+        );
+        let text = request_prompt_text(ResolvedWireApi::Responses, &arr);
+        assert!(text.contains("\"role\":\"user\""), "array input not stringified: {text}");
+        assert!(text.contains("hello"));
+
+        // No `input` ⇒ fall back to the whole body (nothing silently dropped).
+        let no_input = req_at("/v1/responses", br#"{"model":"gpt-4.1"}"#);
+        let text = request_prompt_text(ResolvedWireApi::Responses, &no_input);
+        assert!(text.contains("gpt-4.1"));
+
+        // The Chat lane always records the whole body, unchanged.
+        let chat = req(br#"{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}],"input":"ignored"}"#);
+        let text = request_prompt_text(ResolvedWireApi::Chat, &chat);
+        assert!(text.contains("messages"), "chat lane must record the whole body");
+    }
+
+    #[test]
+    fn responses_prompt_is_redacted_via_input() {
+        // A secret planted in `input` is recorded (from input) AND redacted.
+        let ctx = ctx_with(CapturePolicy::default());
+        let request = req_at(
+            "/v1/responses",
+            br#"{"model":"gpt-4.1","input":"deploy with AKIAIOSFODNN7EXAMPLE"}"#,
+        );
+        let response = json_resp(200, RESPONSES_JSON);
+        let ev = record_llm_event(
+            &ctx,
+            RecordInputs {
+                provider: Provider::OpenAi,
+                wire_api: WireApi::Auto,
+                request: &request,
+                response: &response,
+                price: None,
+                timestamp: MicrosTimestamp(1),
+                duration_ms: None,
+            },
+        );
+        let prompt = ev.input.as_ref().unwrap().as_str().unwrap();
+        assert!(!prompt.contains("AKIAIOSFODNN7EXAMPLE"), "secret leaked: {prompt}");
+        assert!(prompt.contains("REDACTED:CLOUD_KEY:"), "no redaction marker: {prompt}");
+        // The prompt was taken from `input`, so the JSON envelope keys are absent.
+        assert!(!prompt.contains("\"model\""), "prompt should be the input, not the whole body: {prompt}");
+    }
+
+    #[test]
+    fn responses_sse_stream_is_reassembled_then_redacted() {
+        // STREAM-CASE test marker: the Responses SSE shape. output_text.delta
+        // events are concatenated; the terminal response.completed carries the
+        // authoritative usage/model/status. Reassembly happens BEFORE redaction,
+        // so a secret split across deltas is scrubbed in the stored body.
+        let ctx = ctx_with(CapturePolicy::default());
+        let request = req_at("/v1/responses", br#"{"model":"gpt-4.1","stream":true,"input":"hi"}"#);
+        let stream = "event: response.output_text.delta\n\
+                      data: {\"type\":\"response.output_text.delta\",\"delta\":\"key=AKIA\"}\n\n\
+                      event: response.output_text.delta\n\
+                      data: {\"type\":\"response.output_text.delta\",\"delta\":\"IOSFODNN7EXAMPLE done\"}\n\n\
+                      event: response.completed\n\
+                      data: {\"type\":\"response.completed\",\"response\":{\"model\":\"gpt-4.1\",\"status\":\"completed\",\"usage\":{\"input_tokens\":5,\"output_tokens\":12},\"output\":[]}}\n\n";
+        let response = sse_resp(stream);
+        let ev = record_llm_event(
+            &ctx,
+            RecordInputs {
+                provider: Provider::OpenAi,
+                wire_api: WireApi::Auto,
+                request: &request,
+                response: &response,
+                price: None,
+                timestamp: MicrosTimestamp(1),
+                duration_ms: None,
+            },
+        );
+
+        let llm = ev.blocks.llm.as_ref().unwrap();
+        assert_eq!(llm.stream, Some(true), "stream flag set");
+        assert_eq!(llm.model.as_deref(), Some("gpt-4.1"));
+        assert_eq!(llm.input_tokens, Some(5), "usage from terminal response object");
+        assert_eq!(llm.output_tokens, Some(12));
+        assert_eq!(llm.finish_reason.as_deref(), Some("completed"));
+        // The reassembled body is redacted: the secret straddling two deltas is
+        // gone (proving reassembly happened before redaction), benign text stays.
+        let out = ev.output.as_ref().unwrap().as_str().unwrap();
+        assert!(!out.contains("AKIAIOSFODNN7EXAMPLE"), "secret survived reassembly: {out}");
+        assert!(out.contains("done"), "completion text lost: {out}");
+        assert!(out.contains("REDACTED:CLOUD_KEY:"), "no redaction marker: {out}");
+    }
+
+    #[test]
+    fn responses_sse_falls_back_to_final_object_text_without_deltas() {
+        // A stream that emits NO output_text.delta events still records text from
+        // the terminal response object's output[].
+        let stream = "event: response.completed\n\
+                      data: {\"type\":\"response.completed\",\"response\":{\"model\":\"gpt-4.1\",\"status\":\"completed\",\"usage\":{\"input_tokens\":3,\"output_tokens\":4},\"output\":[{\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\"final only\"}]}]}}\n\n";
+        let meta = reassemble_responses_sse(stream.as_bytes());
+        assert_eq!(meta.reassembled_text.as_deref(), Some("final only"));
+        assert_eq!(meta.input_tokens, Some(3));
+        assert_eq!(meta.output_tokens, Some(4));
+        assert_eq!(meta.finish_reason.as_deref(), Some("completed"));
+    }
+
+    #[test]
+    fn responses_sse_auto_detected_when_path_unknown() {
+        // An unknown path + a Responses-typed SSE event ⇒ the SSE shape sniff
+        // routes the stream to the Responses reassembler.
+        let request = req_at("/passthrough", b"{}");
+        let stream = "event: response.output_text.delta\n\
+                      data: {\"type\":\"response.output_text.delta\",\"delta\":\"hi\"}\n\n";
+        let response = sse_resp(stream);
+        let body = decoded_body(&response);
+        assert_eq!(
+            resolve_wire_api(WireApi::Auto, &request, &response, &body),
+            ResolvedWireApi::Responses
+        );
+        // And a chat SSE stream on an unknown path sniffs to Chat.
+        let chat_stream = "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n";
+        let chat = sse_resp(chat_stream);
+        let chat_body = decoded_body(&chat);
+        assert_eq!(
+            resolve_wire_api(WireApi::Auto, &request, &chat, &chat_body),
+            ResolvedWireApi::Chat
+        );
+    }
+
+    #[test]
+    fn gzip_responses_json_is_decoded_then_parsed() {
+        // Parity with the chat gzip test: a Responses JSON body arrives
+        // gzip-compressed. It must be decoded before parsing so tokens/text are
+        // recovered (not gzip garbage).
+        let ctx = ctx_with(CapturePolicy::default());
+        let request = req_at("/v1/responses", br#"{"model":"gpt-4.1-mini","input":"hi"}"#);
+        let response = gzip_resp(200, "application/json", RESPONSES_JSON);
+        assert_eq!(&response.body[..2], &[0x1f, 0x8b], "test body should be gzip");
+
+        let ev = record_llm_event(
+            &ctx,
+            RecordInputs {
+                provider: Provider::OpenAi,
+                wire_api: WireApi::Auto,
+                request: &request,
+                response: &response,
+                price: None,
+                timestamp: MicrosTimestamp(1),
+                duration_ms: None,
+            },
+        );
+        let llm = ev.blocks.llm.as_ref().unwrap();
+        assert_eq!(llm.input_tokens, Some(42), "tokens lost (gzipped Responses body not decoded?)");
+        assert_eq!(llm.output_tokens, Some(9));
+        let out = ev.output.as_ref().unwrap().as_str().unwrap();
+        assert_eq!(out, "Hello, world!");
     }
 }
