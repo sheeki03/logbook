@@ -63,6 +63,37 @@ pub enum InventoryError {
     )]
     ReversibleUnavailable,
 
+    /// A `logbook revert <session>` named a session that has no recorded
+    /// `agent_sessions` row (typo, already forgotten, or never captured here).
+    #[error("no recorded session with id {0:?} to revert")]
+    SessionNotFound(String),
+
+    /// A governance verb (`logbook forget <session>`) was handed a session id
+    /// that is not a well-formed id (empty, contains a path separator or a `..`
+    /// component, is absolute, or is not the 32-hex-char shape
+    /// [`logbook_core::SessionId::generate`] mints). Refused before any
+    /// filesystem deletion so a crafted id (e.g. `../../etc`) can never reach a
+    /// `remove_dir_all` outside the out-dir.
+    #[error(
+        "invalid session id {0:?}: a session id must be a 32-character hex string \
+         (no path separators, no `..`, not absolute)"
+    )]
+    InvalidSessionId(String),
+
+    /// `git` could not be run (or exited non-zero) while reverting a file. The
+    /// command line and git's stderr are surfaced so the user can see exactly
+    /// which restore failed. Revert is conservative: a single git failure aborts
+    /// that file's restore and is reported as a refusal, never a partial write.
+    #[error("git {operation} failed for {path:?}: {detail}")]
+    GitRevert {
+        /// The git operation attempted (e.g. `checkout HEAD --`).
+        operation: String,
+        /// The repo-relative path being restored.
+        path: String,
+        /// git's stderr (or the spawn error), already trimmed.
+        detail: String,
+    },
+
     /// A capture flag was passed that has no mechanism wired here yet. As of
     /// Phase 2 the structured tier has landed (`--capture-prompts` / `--tier
     /// structured` are accepted), so only `--tier complete` (the Phase-4

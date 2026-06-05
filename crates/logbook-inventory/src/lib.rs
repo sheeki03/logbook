@@ -23,6 +23,8 @@
 //! - [`processes`] — best-effort running-agent process listing.
 //! - [`tools`] — detect schrute / security-suite / scanner availability.
 //! - [`wrapper`] — the `logbook agent <cli>` session + git/file-diff recorder.
+//! - [`governance`] — Phase-3 session governance actions (revert / export /
+//!   forget / time-travel diffs) over the recorded sessions + redacted diffs.
 //! - [`scan`] — orchestrate discovery, derive risk findings, persist + emit events.
 //! - [`store_ext`] — SQL upserts/reads for the inventory tables.
 //! - [`report`] — human + JSON rendering.
@@ -48,6 +50,7 @@ pub mod cli;
 pub mod config;
 pub mod endpoint;
 pub mod error;
+pub mod governance;
 pub mod mcp;
 pub mod model;
 pub mod processes;
@@ -59,11 +62,18 @@ pub mod wrapper;
 
 // Common surface re-exports.
 pub use error::{InventoryError, Result};
+pub use governance::{
+    export_session, export_session_with_policy, forget, revert, revert_with_redactor,
+    session_diffs_up_to_turn, ExportBundle, ExportedAction, ExportedSession, ExportedTranscript,
+    ForgetReport, ForgetTarget, RevertDisposition, RevertOutcome, RevertReport, SessionTurnDiffs,
+    TurnFileDiff,
+};
 pub use model::{
     finding_kind, AgentInstall, Endpoint, InventoryFinding, McpServer, McpTransport,
     RunningProcess, SessionTranscriptRecord, ToolPresence,
 };
 pub use scan::{scan, scan_and_persist, ScanContext, ScanReport};
 pub use wrapper::{
-    run_agent, AgentAction, AgentSessionRecord, LogbookOptions, LogbookOutcome,
+    redacted_content_hash, run_agent, AgentAction, AgentSessionRecord, LogbookOptions,
+    LogbookOutcome,
 };

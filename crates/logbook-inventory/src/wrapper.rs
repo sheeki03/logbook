@@ -326,6 +326,9 @@ fn build_redacted_baseline(cwd: &Path, redactor: &Redactor) -> RedactedBaseline 
             continue;
         };
         let redacted = redact_bytes(redactor, &raw);
+        // The hash is over the redacted content (never raw), matching
+        // [`redacted_content_hash`] byte-for-byte so `logbook revert` can
+        // recompute the post-state hash identically.
         let hash = stable_hash(&redacted);
         total_held = total_held.saturating_add(len);
         baseline.files.insert(
@@ -345,6 +348,18 @@ fn build_redacted_baseline(cwd: &Path, redactor: &Redactor) -> RedactedBaseline 
 fn redact_bytes(redactor: &Redactor, raw: &[u8]) -> String {
     let text = String::from_utf8_lossy(raw);
     redactor.redact(&text).into_owned()
+}
+
+/// The canonical post-state hash of a file's **redacted** content: redact the raw
+/// bytes in memory (UTF-8-lossy decode + [`Redactor::redact`]) and stable-hash the
+/// result. This is exactly the `post_hash` the session-diff path records for a
+/// content-held file (the same `stable_hash(redact(content))` the baseline builder
+/// uses), so `logbook revert` can recompute it the **same way** to detect
+/// post-session edits without ever re-reading a raw preimage. Raw bytes are hashed
+/// transiently and dropped — only the digest leaves this function.
+#[must_use]
+pub fn redacted_content_hash(redactor: &Redactor, raw: &[u8]) -> String {
+    stable_hash(&redact_bytes(redactor, raw))
 }
 
 /// Build the change-detection marker for an over-cap file (one whose content is
@@ -656,7 +671,19 @@ fn git_tree_is_clean(cwd: &Path) -> bool {
 ///    `.git`, a corrupted index, a permissions problem) — **warned**.
 fn git_listed_files(cwd: &Path) -> Option<Vec<String>> {
     let out = match Command::new("git")
-        .args(["ls-files", "--cached", "--others", "--exclude-standard"])
+        // `-c core.quotePath=false` keeps non-ASCII paths literal (git otherwise
+        // C-quotes them, e.g. `"\303\251.txt"`), and `-z` NUL-delimits the output
+        // so paths containing spaces, newlines, or quotes parse correctly — split
+        // on `\0` below instead of `lines()`, which would mangle such paths.
+        .args([
+            "-c",
+            "core.quotePath=false",
+            "ls-files",
+            "-z",
+            "--cached",
+            "--others",
+            "--exclude-standard",
+        ])
         .current_dir(cwd)
         .output()
     {
@@ -688,10 +715,14 @@ fn git_listed_files(cwd: &Path) -> Option<Vec<String>> {
         }
         return None;
     }
+    // `-z` NUL-delimits entries (and emits no trailing record after the last
+    // NUL). Split on `\0`, not lines(): a path may legitimately contain spaces or
+    // even a newline, and with `core.quotePath=false` a UTF-8 path is emitted
+    // literally — both of which `lines()` would mis-parse.
     let text = String::from_utf8_lossy(&out.stdout);
     Some(
-        text.lines()
-            .filter(|l| !l.is_empty())
+        text.split('\0')
+            .filter(|p| !p.is_empty())
             .map(str::to_string)
             .collect(),
     )
@@ -1315,5 +1346,51 @@ mod tests {
         assert_eq!(act.kind, "file_modified");
         assert_eq!(act.detail.as_deref(), Some("diff omitted (size)"));
         assert!(act.diff.is_none(), "over-cap action carries no body");
+    }
+
+    /// Regression (MEDIUM): `git_listed_files` must handle paths with a space and
+    /// non-ASCII (UTF-8) characters. The old `ls-files` (no `-z`, default
+    /// `core.quotePath`) split on `lines()`, which mangled a quoted/multi-token
+    /// path. The fix invokes `git -c core.quotePath=false ls-files -z …` and splits
+    /// on `\0`, so the literal path comes back intact. We assert via
+    /// `build_redacted_baseline` (which consumes `git_listed_files`) so the whole
+    /// path is exercised, and the file is detected under its true name.
+    #[test]
+    fn git_listed_files_handles_space_and_utf8_paths() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cwd = tmp.path();
+        init_repo(cwd);
+
+        // A path with a space and a non-ASCII (UTF-8) path. Under the old code git
+        // would C-quote `café.txt` (→ `"caf\303\251.txt"`) and `lines()` could not
+        // recover either real path.
+        let spaced = "a file with spaces.txt";
+        let utf8 = "café_app.txt";
+        std::fs::write(cwd.join(spaced), "hello\n").unwrap();
+        std::fs::write(cwd.join(utf8), "bonjour\n").unwrap();
+
+        // Direct: the lister returns the literal paths (no quoting, no truncation).
+        let listed = git_listed_files(cwd).expect("git ls-files in a repo");
+        assert!(
+            listed.iter().any(|p| p == spaced),
+            "spaced path must come back intact: {listed:?}"
+        );
+        assert!(
+            listed.iter().any(|p| p == utf8),
+            "utf-8 path must come back intact (not C-quoted): {listed:?}"
+        );
+
+        // End-to-end: the baseline keyed by path contains both files' content.
+        let baseline = build_redacted_baseline(cwd, &red());
+        assert!(
+            baseline.files.contains_key(spaced),
+            "baseline must key the spaced file: {:?}",
+            baseline.files.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            baseline.files.contains_key(utf8),
+            "baseline must key the utf-8 file: {:?}",
+            baseline.files.keys().collect::<Vec<_>>()
+        );
     }
 }
