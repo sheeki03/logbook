@@ -296,6 +296,25 @@ impl StoreInner {
             .send_blocking(move |ack| WriteCmd::Exec(Box::new(f), ack))
     }
 
+    /// Run a mutating closure on the single write connection and return its
+    /// value. Like [`Self::exec`] but threads a typed value back through a
+    /// oneshot channel, so prune/forget/governance helpers can report stats.
+    /// All mutations still serialize through the one writer thread.
+    pub(crate) fn write_with<T, F>(&self, f: F) -> Result<T>
+    where
+        F: FnOnce(&mut Connection) -> Result<T> + Send + 'static,
+        T: Send + 'static,
+    {
+        let (tx, rx) = mpsc::channel::<Result<T>>();
+        self.exec(move |conn| {
+            let _ = tx.send(f(conn));
+            Ok(())
+        })?;
+        // `exec` blocks until the writer has run (and dropped) the closure, so
+        // exactly one message is queued by the time we receive here.
+        rx.recv().map_err(|_| StoreError::WriterGone)?
+    }
+
     /// Run a read closure against a read-pool connection.
     ///
     /// For `:memory:` stores the read pool can't be used (each `:memory:` open

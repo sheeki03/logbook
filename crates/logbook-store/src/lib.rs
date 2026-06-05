@@ -33,6 +33,7 @@
 pub mod error;
 pub mod jsonl;
 pub mod query;
+pub mod retention;
 pub mod schema;
 mod writer;
 
@@ -41,13 +42,14 @@ use std::sync::Arc;
 
 use rusqlite::Connection;
 
-use logbook_core::Event;
+use logbook_core::{CapturePolicy, Event};
 
 pub use error::{Result, StoreError};
 pub use jsonl::{read_jsonl, read_jsonl_opt, JsonlWriter, JSONL_FILENAME};
 pub use query::{
     count_events, get_trace, query_events, token_cost_rollup, CostRow, Query,
 };
+pub use retention::{ForgetStats, PruneStats, SessionTree, TurnGroup};
 
 use writer::StoreInner;
 
@@ -168,6 +170,88 @@ impl Store {
         F: FnOnce(&mut Connection) -> Result<()> + Send + 'static,
     {
         self.inner.exec(f)
+    }
+
+    /// Run a mutating closure against the single write connection and return its
+    /// value (e.g. a delete count). Like [`Store::write`] but threads a typed
+    /// value back from the writer thread, for prune/forget-style helpers that
+    /// report stats.
+    ///
+    /// # Errors
+    /// Returns a [`StoreError`] if the closure fails or the writer is gone.
+    pub fn write_returning<T, F>(&self, f: F) -> Result<T>
+    where
+        F: FnOnce(&mut Connection) -> Result<T> + Send + 'static,
+        T: Send + 'static,
+    {
+        self.inner.write_with(f)
+    }
+
+    /// Build the correlation timeline ([`SessionTree`]) for a session: its
+    /// events grouped by turn (turns as parents, oldest-first within each turn),
+    /// turns ascending with the turn-less group last (plan §3, "Correlation
+    /// timeline"). Reads only; safe to run concurrently.
+    ///
+    /// # Errors
+    /// Returns a [`StoreError`] if the read fails.
+    pub fn session_tree(&self, session_id: &str) -> Result<SessionTree> {
+        let session_id = session_id.to_string();
+        self.inner
+            .read(move |conn| retention::session_tree(conn, &session_id))
+    }
+
+    /// Enforce retention against the `events` table (plan §3): a per-class age
+    /// sweep keyed on `events.max_sensitivity` (each class's `max_age_days`,
+    /// falling back to the global `retention.max_age_days`), then a global size
+    /// sweep that deletes the oldest rows until the store is back under
+    /// `retention.max_db_mb`. Returns the [`PruneStats`] describing what was
+    /// removed.
+    ///
+    /// Run at `ui`/`agent` startup. Only the `events` spine is pruned here;
+    /// inventory rows are governed by [`Store::forget_session`] /
+    /// [`Store::forget_before`].
+    ///
+    /// # Errors
+    /// Returns a [`StoreError`] if a delete or size probe fails or the writer is
+    /// gone.
+    pub fn prune(
+        &self,
+        policy: &CapturePolicy,
+        retention: &logbook_core::config::Retention,
+        now_micros: i64,
+    ) -> Result<PruneStats> {
+        // The closure must be `'static`; clone the small policy/retention in.
+        // (Bind to distinct names so they don't shadow the `retention` module.)
+        let policy = policy.clone();
+        let retention_cfg = retention.clone();
+        self.inner.write_with(move |conn| {
+            crate::retention::prune(conn, &policy, &retention_cfg, now_micros)
+        })
+    }
+
+    /// Forget exactly one session's data (`logbook forget <session>`): delete its
+    /// `events` (matched on `session_id` plus the session's `trace_id`) and its
+    /// `agent_sessions` row; the session's `agent_actions` / `session_transcripts`
+    /// cascade. Returns the [`ForgetStats`]. Idempotent for an absent session.
+    ///
+    /// # Errors
+    /// Returns a [`StoreError`] if a delete fails or the writer is gone.
+    pub fn forget_session(&self, session_id: &str) -> Result<ForgetStats> {
+        let session_id = session_id.to_string();
+        self.inner
+            .write_with(move |conn| retention::forget_session(conn, &session_id))
+    }
+
+    /// Forget everything older than `micros` (`logbook forget --before <ts>`):
+    /// delete `events` with `timestamp < micros` and `agent_sessions` whose
+    /// `started_at < micros` (their inventory rows cascade). Returns the
+    /// [`ForgetStats`].
+    ///
+    /// # Errors
+    /// Returns a [`StoreError`] if a delete fails or the writer is gone.
+    pub fn forget_before(&self, micros: i64) -> Result<ForgetStats> {
+        self.inner
+            .write_with(move |conn| retention::forget_before(conn, micros))
     }
 
     /// Flush and shut down the single-writer thread. Called automatically on
