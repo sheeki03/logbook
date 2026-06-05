@@ -42,6 +42,35 @@ pub enum InventoryError {
         #[source]
         source: std::io::Error,
     },
+
+    /// The PTY capture pipeline (transcript + line-events) failed while running
+    /// the wrapped agent.
+    #[error("capture pipeline failed for {command:?}: {source}")]
+    Capture {
+        /// The command line that failed.
+        command: String,
+        /// The underlying capture error.
+        #[source]
+        source: logbook_capture::CaptureError,
+    },
+
+    /// `--reversible` (encrypted dirty-tree preimages) was requested but is not
+    /// yet available. The clean-tree path is always revertable via git itself;
+    /// only the dirty-tree opt-in is pending key management.
+    #[error(
+        "reversible dirty-tree capture is not yet available \
+         (encrypted-preimage key management pending)"
+    )]
+    ReversibleUnavailable,
+
+    /// A Phase-2/4 capture flag was passed that has no mechanism in Phase 1
+    /// (`--capture-prompts`, `--tier structured|complete`). Rejected rather than
+    /// silently no-op'd so the user is not misled.
+    #[error("{flag}: structured capture lands in Phase 2 (not available yet)")]
+    UnsupportedFlag {
+        /// The rejected flag (e.g. `--capture-prompts`).
+        flag: String,
+    },
 }
 
 /// Convenience alias for results in this crate.

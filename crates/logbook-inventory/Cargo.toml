@@ -17,6 +17,9 @@ tracing = { workspace = true }
 toml = "1.1"
 clap = { version = "4.6", features = ["derive"] }
 rusqlite = "0.38"
+similar = { version = "2.7.0", default-features = false, features = ["text"] }
+logbook-capture = { version = "0.1.0", path = "../logbook-capture" }
+tokio = { workspace = true, features = ["rt"] }
 
 [dev-dependencies]
 tempfile = "3.27.0"

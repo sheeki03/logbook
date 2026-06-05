@@ -14,10 +14,11 @@ use std::path::PathBuf;
 
 use clap::{Args, Subcommand};
 
+use logbook_core::{CapturePolicy, CliOverlay, Redactor, SensitivityClass};
 use logbook_store::Store;
 
-use crate::config::InventoryConfig;
 use crate::error::Result;
+use crate::model::SessionTranscriptRecord;
 use crate::report;
 use crate::scan::{self, ScanContext};
 use crate::store_ext;
@@ -90,16 +91,96 @@ pub struct ReportArgs {
     pub rescan: bool,
 }
 
-/// `logbook agent <cli...>` — wrap an agent CLI, recording a session + diffs.
+/// `logbook agent <cli...>` — wrap an agent CLI, recording a session +
+/// session-accurate redacted file diffs (plan §1.5).
 #[derive(Debug, Args)]
 pub struct AgentArgs {
-    /// Out-dir holding the logbook store.
+    /// Out-dir holding the logbook store + transcript files.
     #[arg(long, default_value = ".logbook")]
     pub out_dir: PathBuf,
+
+    /// Capture session-accurate file diffs (the Phase-1 default; redacted-only).
+    #[arg(long, overrides_with = "no_capture_diffs")]
+    pub capture_diffs: bool,
+    /// Disable file-diff capture for this session (`diff = None`, behaviour
+    /// identical to pre-Orbit).
+    #[arg(long, overrides_with = "capture_diffs")]
+    pub no_capture_diffs: bool,
+
+    /// Per-file redacted-diff body cap, in bytes (overrides the `file_diffs`
+    /// class default of 256 KiB).
+    #[arg(long)]
+    pub diff_max_bytes: Option<u64>,
+
+    /// Opt in to encrypted preimages so a dirty-tree session is revertable.
+    /// **Not yet available** — rejected with a clear error (key management
+    /// pending). The clean-tree path is always revertable via git itself.
+    #[arg(long)]
+    pub reversible: bool,
+
+    /// Disable the **general** (non-secret) redactor for this session. The
+    /// secrets floor (cloud keys, JWT, bearer, PEM, …) is **never** disabled —
+    /// `--no-redact` only drops the general / `deny`-pattern layer.
+    #[arg(long)]
+    pub no_redact: bool,
+
+    /// Phase-2 flag (rejected in Phase 1): structured prompt capture has no
+    /// mechanism yet, so this is refused rather than silently no-op'd.
+    #[arg(long)]
+    pub capture_prompts: bool,
+
+    /// Fidelity tier. Only `universal` is meaningful in Phase 1; `structured` /
+    /// `complete` are **rejected** (they land in Phase 2 / Phase 4).
+    #[arg(long)]
+    pub tier: Option<String>,
+
     /// The agent command line to run (e.g. `claude --resume`). Everything after
     /// the subcommand is captured verbatim.
     #[arg(trailing_var_arg = true, required = true, num_args = 1..)]
     pub command: Vec<String>,
+}
+
+impl AgentArgs {
+    /// The resolved `--capture-diffs` / `--no-capture-diffs` choice as the
+    /// `CliOverlay::capture_diffs` tri-state (`None` = neither flag set, leave the
+    /// layered value untouched).
+    fn capture_diffs_choice(&self) -> Option<bool> {
+        match (self.capture_diffs, self.no_capture_diffs) {
+            (true, _) => Some(true),
+            (_, true) => Some(false),
+            _ => None,
+        }
+    }
+
+    /// Reject the Phase-2/4 flags that have no capture mechanism in Phase 1, so a
+    /// user is never misled into thinking structured capture is happening.
+    ///
+    /// # Errors
+    /// Returns [`InventoryError::UnsupportedFlag`] for `--capture-prompts` or a
+    /// `--tier structured|complete`.
+    fn reject_phase2_flags(&self) -> Result<()> {
+        if self.capture_prompts {
+            return Err(crate::error::InventoryError::UnsupportedFlag {
+                flag: "--capture-prompts".to_string(),
+            });
+        }
+        if let Some(tier) = self.tier.as_deref() {
+            match tier.to_ascii_lowercase().as_str() {
+                "universal" => {}
+                "structured" | "complete" => {
+                    return Err(crate::error::InventoryError::UnsupportedFlag {
+                        flag: format!("--tier {tier}"),
+                    });
+                }
+                other => {
+                    return Err(crate::error::InventoryError::UnsupportedFlag {
+                        flag: format!("--tier {other} (expected `universal`)"),
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Dispatch an `inventory` invocation, writing output to `out`.
@@ -174,30 +255,124 @@ pub fn run_with_context(
     }
 }
 
-/// Run the `agent` wrapper: spawn the agent CLI, record a session + diffs.
+/// Run the `agent` wrapper: drive the agent CLI through the PTY capture pipeline
+/// and record a session, session-accurate redacted file diffs, and a transcript
+/// row — all under one `trace_id`/`session_id` (plan §1.1/§1.2/§1.3).
+///
+/// The capture policy is resolved via the shared, **fail-closed**
+/// [`CapturePolicy::resolve`] (recorder-on defaults → strict `<root>/logbook.toml`
+/// `[capture]` → `<out_dir>/capture-state.json` narrow-only → CLI flags), so the
+/// cross-process UI pause toggle is honoured here too. Diff capture is gated on
+/// `should_capture(FileDiffs)`.
 ///
 /// # Errors
-/// Returns a [`crate::InventoryError`] if the agent cannot be launched or the
-/// session cannot be persisted.
+/// Returns a [`crate::InventoryError`] if a rejected Phase-2 flag was passed, the
+/// agent cannot be launched, capture fails, `--reversible` is requested on a
+/// dirty tree, or the session cannot be persisted.
 pub fn run_agent_wrapper(args: &AgentArgs, out: &mut impl Write) -> Result<()> {
     let project = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    let config = InventoryConfig::load_from_dir(&project);
-    let redactor = scan::ScanContext::discover(home_dir(), &project).redactor();
-    let _ = config;
+    run_agent_wrapper_in(args, project, out)
+}
+
+/// Like [`run_agent_wrapper`] but with an explicit project/cwd root (the seam
+/// tests use to run + diff in a chosen directory without mutating process state,
+/// mirroring [`run_with_context`]). The `project` dir is both the agent's working
+/// directory and the root the capture policy + `[redaction]` config load from.
+///
+/// # Errors
+/// Same as [`run_agent_wrapper`].
+pub fn run_agent_wrapper_in(
+    args: &AgentArgs,
+    project: PathBuf,
+    out: &mut impl Write,
+) -> Result<()> {
+    // Reject Phase-2/4 flags up front (no misleading no-ops).
+    args.reject_phase2_flags()?;
+
+    // The general-redaction switch from `[redaction].enabled` (the security-
+    // bearing capture policy is loaded fail-closed below via `resolve`; this soft
+    // load only supplies the redactor's deny/allow patterns + enabled bit).
+    let inv_cfg = crate::config::InventoryConfig::load_from_dir(&project);
+    let general_redaction_enabled = inv_cfg.redaction.enabled && !args.no_redact;
+
+    // Resolve the capture policy through the shared fail-closed helper, layering
+    // the CLI flags on top (`--capture-diffs`, `--diff-max-bytes`, `--no-redact`).
+    let overlay = CliOverlay {
+        capture_diffs: args.capture_diffs_choice(),
+        diff_max_bytes: args.diff_max_bytes,
+        no_redact: args.no_redact,
+        master_enabled: None,
+    };
+    let policy = CapturePolicy::resolve(&project, &args.out_dir, overlay);
+
+    // Build the redactor: the full general redactor when enabled (honouring the
+    // user's `[redaction] deny`/`allow` patterns), else the secrets floor only.
+    // The floor always runs — `--no-redact` can never expose a secret, and the
+    // `file_diffs` class is force-redacted (`RedactionMode::Always`) regardless.
+    let redactor = if general_redaction_enabled {
+        logbook_core::redact::from_config(true, &inv_cfg.redaction.deny, &inv_cfg.redaction.allow)
+            .unwrap_or_else(|_| {
+                tracing::warn!("invalid redaction deny pattern in config; using built-in rules");
+                Redactor::new().with_process_env()
+            })
+    } else {
+        Redactor::secrets_floor_with_process_env()
+    };
+
+    if args.no_redact {
+        writeln!(
+            out,
+            "logbook: WARNING --no-redact is set; the secrets floor still applies, \
+             but non-secret content in diffs/transcript may be persisted to {}.",
+            args.out_dir.display()
+        )?;
+    }
 
     let endpoint = crate::endpoint::local_endpoint();
     let opts = LogbookOptions {
         cwd: project,
+        out_dir: args.out_dir.clone(),
         endpoint_id: Some(endpoint.id.clone()),
         spawn: true,
+        policy,
+        redaction_enabled: general_redaction_enabled,
+        reversible: args.reversible,
     };
 
     let store = Store::open_in_dir(&args.out_dir)?;
     store_ext::upsert_endpoint(&store, &endpoint)?;
 
-    let outcome = wrapper::run_agent(&args.command, &opts, &redactor)?;
+    // Drive the async capture pipeline on a small current-thread runtime (like
+    // `commands/run.rs`). Interactive stdin keeps working — the PTY forwards it.
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(crate::error::InventoryError::Io)?;
+    let outcome = rt.block_on(wrapper::run_agent(&args.command, &opts, &redactor))?;
+
     store_ext::insert_agent_session(&store, &outcome.session)?;
     store_ext::insert_agent_actions(&store, &outcome.session.session_id, &outcome.actions)?;
+
+    // Write the `session_transcripts` row from the capture outcome (plan §1.3),
+    // only when a transcript was actually captured (the Transcript class may have
+    // been narrowed off by the policy / UI toggle, leaving both tiers absent).
+    if let Some(t) = &outcome.transcript {
+        if t.terminal_log_path.is_some() || t.text_path.is_some() {
+            let rec = SessionTranscriptRecord {
+                session_id: outcome.session.session_id.clone(),
+                trace_id: outcome.session.trace_id.clone(),
+                terminal_log_path: t
+                    .terminal_log_path
+                    .as_ref()
+                    .map(|p| p.display().to_string()),
+                text_path: t.text_path.as_ref().map(|p| p.display().to_string()),
+                line_count: Some(t.line_count as i64),
+                byte_size: Some(t.byte_size as i64),
+                max_sensitivity: SensitivityClass::Transcript.as_str().to_string(),
+            };
+            store_ext::insert_session_transcript(&store, &rec)?;
+        }
+    }
 
     writeln!(
         out,
@@ -279,6 +454,7 @@ fn home_dir() -> PathBuf {
 mod tests {
     use super::*;
     use clap::Parser;
+    use rusqlite::params;
 
     // A tiny test harness CLI that embeds InventoryArgs, to exercise parsing.
     #[derive(Debug, Parser)]
@@ -320,6 +496,38 @@ mod tests {
         }
     }
 
+    /// A bare `AgentArgs` for an out-dir + command (all new flags default off).
+    fn agent_args(out_dir: PathBuf, command: Vec<String>) -> AgentArgs {
+        AgentArgs {
+            out_dir,
+            capture_diffs: false,
+            no_capture_diffs: false,
+            diff_max_bytes: None,
+            reversible: false,
+            no_redact: false,
+            capture_prompts: false,
+            tier: None,
+            command,
+        }
+    }
+
+    fn init_repo(cwd: &std::path::Path) {
+        assert!(std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(cwd)
+            .status()
+            .unwrap()
+            .success());
+        let _ = std::process::Command::new("git")
+            .args(["config", "user.email", "t@t"])
+            .current_dir(cwd)
+            .status();
+        let _ = std::process::Command::new("git")
+            .args(["config", "user.name", "t"])
+            .current_dir(cwd)
+            .status();
+    }
+
     #[test]
     fn parses_agent_trailing_args() {
         let cli = TestCli::try_parse_from(["x", "agent", "claude", "--resume", "--model", "opus"])
@@ -330,6 +538,52 @@ mod tests {
             }
             _ => panic!("expected agent"),
         }
+    }
+
+    #[test]
+    fn parses_agent_capture_flags() {
+        // `--no-capture-diffs` after the subcommand, before the trailing command.
+        let cli = TestCli::try_parse_from([
+            "x",
+            "agent",
+            "--no-capture-diffs",
+            "--diff-max-bytes",
+            "1024",
+            "--no-redact",
+            "--",
+            "claude",
+        ])
+        .unwrap();
+        match cli.inv {
+            TopCmd::Agent(a) => {
+                assert!(a.no_capture_diffs && !a.capture_diffs);
+                assert_eq!(a.capture_diffs_choice(), Some(false));
+                assert_eq!(a.diff_max_bytes, Some(1024));
+                assert!(a.no_redact);
+                assert_eq!(a.command, vec!["claude"]);
+            }
+            _ => panic!("expected agent"),
+        }
+    }
+
+    #[test]
+    fn rejects_phase2_flags() {
+        let outdir = tempfile::tempdir().unwrap();
+        // --capture-prompts is rejected.
+        let mut a = agent_args(outdir.path().to_path_buf(), vec!["/bin/sh".into()]);
+        a.capture_prompts = true;
+        assert!(matches!(
+            a.reject_phase2_flags(),
+            Err(crate::error::InventoryError::UnsupportedFlag { .. })
+        ));
+        // --tier structured / complete are rejected; universal is accepted.
+        let mut a2 = agent_args(outdir.path().to_path_buf(), vec!["/bin/sh".into()]);
+        a2.tier = Some("structured".into());
+        assert!(a2.reject_phase2_flags().is_err());
+        a2.tier = Some("complete".into());
+        assert!(a2.reject_phase2_flags().is_err());
+        a2.tier = Some("universal".into());
+        assert!(a2.reject_phase2_flags().is_ok());
     }
 
     #[test]
@@ -416,12 +670,13 @@ mod tests {
     #[test]
     fn agent_wrapper_records_session() {
         let outdir = tempfile::tempdir().unwrap();
-        let args = AgentArgs {
-            out_dir: outdir.path().to_path_buf(),
-            command: vec!["/bin/sh".into(), "-c".into(), "true".into()],
-        };
+        let project = tempfile::tempdir().unwrap();
+        let args = agent_args(
+            outdir.path().to_path_buf(),
+            vec!["/bin/sh".into(), "-c".into(), "true".into()],
+        );
         let mut buf = Vec::new();
-        run_agent_wrapper(&args, &mut buf).unwrap();
+        run_agent_wrapper_in(&args, project.path().to_path_buf(), &mut buf).unwrap();
         let text = String::from_utf8(buf).unwrap();
         assert!(text.contains("agent session recorded"));
         // Confirm a row landed.
@@ -429,6 +684,136 @@ mod tests {
         assert_eq!(
             store_ext::count_rows(&store, store_ext::InventoryTable::AgentSessions).unwrap(),
             1
+        );
+    }
+
+    #[test]
+    fn one_trace_shared_across_transcript_events_session_and_actions() {
+        // §1.6: `logbook agent -- /bin/sh -c "echo hi > f.txt"` ⇒ one trace_id
+        // shared by the transcript file pointers, the structured line-events, the
+        // agent_sessions row, the agent_actions, and the session_transcripts row.
+        let outdir = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        init_repo(project.path());
+
+        // Emit a line to the PTY stdout (→ a structured line-event) AND create a
+        // file (→ a diffed action), so the single shared trace is exercised across
+        // the transcript, the line-events, the session, the actions, and the
+        // transcript row all at once.
+        let args = agent_args(
+            outdir.path().to_path_buf(),
+            vec![
+                "/bin/sh".into(),
+                "-c".into(),
+                "echo session-line; echo hi > f.txt".into(),
+            ],
+        );
+        let mut buf = Vec::new();
+        run_agent_wrapper_in(&args, project.path().to_path_buf(), &mut buf).unwrap();
+
+        let store = Store::open_in_dir(outdir.path()).unwrap();
+        // The session row + its trace.
+        let (sess_id, sess_trace): (String, String) = store
+            .read(|conn| {
+                Ok(conn.query_row(
+                    "SELECT id, trace_id FROM agent_sessions",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )?)
+            })
+            .unwrap();
+        assert_eq!(sess_trace.len(), 32);
+        // The session_transcripts row shares the session id + trace.
+        let (tr_sess, tr_trace, has_terminal): (String, String, bool) = store
+            .read(|conn| {
+                Ok(conn.query_row(
+                    "SELECT session_id, trace_id, terminal_log_path IS NOT NULL
+                     FROM session_transcripts",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get::<_, i64>(2)? == 1)),
+                )?)
+            })
+            .unwrap();
+        assert_eq!(tr_sess, sess_id, "transcript joins the session");
+        assert_eq!(tr_trace, sess_trace, "transcript shares the trace");
+        assert!(has_terminal, "transcript pointer recorded");
+        // The agent_actions for this session carry the file diff under the session.
+        let sess_id_for_q = sess_id.clone();
+        let action_count: i64 = store
+            .read(move |conn| {
+                Ok(conn.query_row(
+                    "SELECT COUNT(*) FROM agent_actions WHERE session_id = ?1",
+                    params![sess_id_for_q],
+                    |r| r.get(0),
+                )?)
+            })
+            .unwrap();
+        assert!(action_count >= 1, "expected ≥1 diffed action");
+        // The structured line-events captured by the PTY share the same trace.
+        let event_trace_matches = !store.trace(&sess_trace).unwrap().is_empty();
+        assert!(event_trace_matches, "line-events recorded under the shared trace");
+    }
+
+    #[test]
+    fn cross_process_toggle_master_off_captures_nothing() {
+        // §1.6 cross-process toggle: writing <out_dir>/capture-state.json with the
+        // master switch off makes a subsequent `logbook agent` capture nothing —
+        // no transcript row, no diffed actions (the secrets floor still applies to
+        // anything that *would* be written).
+        let outdir = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        init_repo(project.path());
+        // The UI toggle's narrow-only overlay: master off.
+        let state = logbook_core::CaptureState {
+            enabled: Some(false),
+            ..Default::default()
+        };
+        state.save(outdir.path()).unwrap();
+
+        let args = agent_args(
+            outdir.path().to_path_buf(),
+            vec!["/bin/sh".into(), "-c".into(), "echo hi > paused.txt".into()],
+        );
+        let mut buf = Vec::new();
+        run_agent_wrapper_in(&args, project.path().to_path_buf(), &mut buf).unwrap();
+
+        let store = Store::open_in_dir(outdir.path()).unwrap();
+        // Session row still recorded (the session happened), but no diffs captured.
+        assert_eq!(
+            store_ext::count_rows(&store, store_ext::InventoryTable::AgentSessions).unwrap(),
+            1
+        );
+        assert_eq!(
+            store_ext::count_rows(&store, store_ext::InventoryTable::AgentActions).unwrap(),
+            0,
+            "master-off ⇒ no diffed actions"
+        );
+        assert_eq!(
+            store_ext::count_rows(&store, store_ext::InventoryTable::SessionTranscripts).unwrap(),
+            0,
+            "master-off ⇒ transcript tier not written ⇒ no transcript row"
+        );
+    }
+
+    #[test]
+    fn no_capture_diffs_flag_yields_no_actions() {
+        // §1.6: --no-capture-diffs ⇒ diff=None / no actions, behaviour identical
+        // to pre-Orbit.
+        let outdir = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        init_repo(project.path());
+        let mut args = agent_args(
+            outdir.path().to_path_buf(),
+            vec!["/bin/sh".into(), "-c".into(), "echo hi > x.txt".into()],
+        );
+        args.no_capture_diffs = true;
+        let mut buf = Vec::new();
+        run_agent_wrapper_in(&args, project.path().to_path_buf(), &mut buf).unwrap();
+        let store = Store::open_in_dir(outdir.path()).unwrap();
+        assert_eq!(
+            store_ext::count_rows(&store, store_ext::InventoryTable::AgentActions).unwrap(),
+            0,
+            "--no-capture-diffs ⇒ no actions"
         );
     }
 }

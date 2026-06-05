@@ -114,6 +114,33 @@ pub struct ToolPresence {
     pub detail: Option<String>,
 }
 
+/// A `session_transcripts` row (plan §1.3): pointers + metadata for a captured
+/// agent session's redacted transcript. The bulk bytes already live on disk
+/// (the `*.terminal.log` / `*.txt` tiers); this row points at them under the
+/// session's shared `trace_id` so replay can stream the file or render the
+/// structured per-line events (already in `events`).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionTranscriptRecord {
+    /// Session id (== `agent_sessions.id`, the primary key here).
+    pub session_id: String,
+    /// The shared correlation trace id (hex) across all session artifacts.
+    pub trace_id: String,
+    /// Path to the redacted `*.terminal.log` transcript, if that tier was
+    /// written.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub terminal_log_path: Option<String>,
+    /// Path to the ANSI-stripped `*.txt` cleaned text, if that tier was written.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub text_path: Option<String>,
+    /// Number of structured line-events emitted (one per completed cleaned line).
+    pub line_count: Option<i64>,
+    /// Byte length of the redacted transcript persisted to the `.terminal.log`
+    /// tier.
+    pub byte_size: Option<i64>,
+    /// Most-sensitive class present (defaults to `transcript`).
+    pub max_sensitivity: String,
+}
+
 /// A risk / shadow finding (advisory, local-only).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InventoryFinding {

@@ -61,7 +61,9 @@ pub mod wrapper;
 pub use error::{InventoryError, Result};
 pub use model::{
     finding_kind, AgentInstall, Endpoint, InventoryFinding, McpServer, McpTransport,
-    RunningProcess, ToolPresence,
+    RunningProcess, SessionTranscriptRecord, ToolPresence,
 };
 pub use scan::{scan, scan_and_persist, ScanContext, ScanReport};
-pub use wrapper::{run_agent, AgentAction, LogbookOptions, LogbookOutcome, AgentSessionRecord};
+pub use wrapper::{
+    run_agent, AgentAction, AgentSessionRecord, LogbookOptions, LogbookOutcome,
+};

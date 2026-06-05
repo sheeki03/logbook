@@ -12,7 +12,7 @@ use logbook_store::Store;
 use rusqlite::params;
 
 use crate::error::Result;
-use crate::model::{AgentInstall, Endpoint, InventoryFinding, McpServer};
+use crate::model::{AgentInstall, Endpoint, InventoryFinding, McpServer, SessionTranscriptRecord};
 use crate::wrapper::{AgentAction, AgentSessionRecord};
 
 /// Current wall-clock microseconds (matches the store's INTEGER-µs convention).
@@ -196,7 +196,11 @@ pub fn insert_agent_session(store: &Store, rec: &AgentSessionRecord) -> Result<(
     Ok(())
 }
 
-/// Insert the `agent_actions` (git/file diffs) observed during a session.
+/// Insert the `agent_actions` (session-accurate file diffs) observed during a
+/// session, including the Phase-1 V2 columns: the redacted `diff` body, its
+/// pre-truncation `diff_bytes`, the `post_hash`, `revert_safe`, and
+/// `max_sensitivity` (plan §1.2). Everything written here is already redacted
+/// upstream by the wrapper.
 ///
 /// # Errors
 /// Returns a [`crate::InventoryError`] if the write fails.
@@ -212,8 +216,9 @@ pub fn insert_agent_actions(
         {
             let mut stmt = tx.prepare(
                 "INSERT OR REPLACE INTO agent_actions
-                   (id, session_id, kind, path, detail, observed_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                   (id, session_id, kind, path, detail, observed_at,
+                    diff, diff_bytes, post_hash, revert_safe, max_sensitivity)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             )?;
             for a in &actions {
                 stmt.execute(params![
@@ -223,10 +228,49 @@ pub fn insert_agent_actions(
                     a.path,
                     a.detail,
                     a.observed_at,
+                    a.diff,
+                    // SQLite stores INTEGER as i64; widen the byte count safely.
+                    a.diff_bytes.map(|n| n as i64),
+                    a.post_hash,
+                    i64::from(a.revert_safe),
+                    a.max_sensitivity,
                 ])?;
             }
         }
         tx.commit()?;
+        Ok(())
+    })?;
+    Ok(())
+}
+
+/// Insert (or replace) the `session_transcripts` row for a session (plan §1.3):
+/// pointers + metadata for the captured agent session's redacted transcript (the
+/// bulk bytes already live on disk). Keyed on `session_id`, so re-running the
+/// wrapper for the same session replaces the row. Written by the wrapper from
+/// [`logbook_capture::CaptureOutcome::transcript`].
+///
+/// # Errors
+/// Returns a [`crate::InventoryError`] if the write fails.
+pub fn insert_session_transcript(store: &Store, rec: &SessionTranscriptRecord) -> Result<()> {
+    let rec = rec.clone();
+    let now = now_micros();
+    store.write(move |conn| {
+        conn.execute(
+            "INSERT OR REPLACE INTO session_transcripts
+               (session_id, trace_id, terminal_log_path, text_path,
+                line_count, byte_size, max_sensitivity, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                rec.session_id,
+                rec.trace_id,
+                rec.terminal_log_path,
+                rec.text_path,
+                rec.line_count,
+                rec.byte_size,
+                rec.max_sensitivity,
+                now,
+            ],
+        )?;
         Ok(())
     })?;
     Ok(())
@@ -314,6 +358,8 @@ pub enum InventoryTable {
     AgentSessions,
     /// `agent_actions`
     AgentActions,
+    /// `session_transcripts`
+    SessionTranscripts,
     /// `inventory_findings`
     InventoryFindings,
 }
@@ -329,6 +375,7 @@ impl InventoryTable {
             InventoryTable::McpServers => "mcp_servers",
             InventoryTable::AgentSessions => "agent_sessions",
             InventoryTable::AgentActions => "agent_actions",
+            InventoryTable::SessionTranscripts => "session_transcripts",
             InventoryTable::InventoryFindings => "inventory_findings",
         }
     }
