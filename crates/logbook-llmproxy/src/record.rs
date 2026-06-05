@@ -21,6 +21,9 @@
 //!
 //! Nothing in this module logs or persists a raw payload.
 
+use std::borrow::Cow;
+use std::io::Read;
+
 use logbook_core::{Category, Event, Kind, LlmBlock, MicrosTimestamp, SensitivityClass, Status};
 use logbook_harness::HarnessContext;
 
@@ -46,6 +49,86 @@ pub struct RecordInputs<'a> {
     /// Span duration in milliseconds (wall time of the upstream round-trip), if
     /// measured.
     pub duration_ms: Option<f64>,
+}
+
+/// Decode an upstream response body for **recording only**, honoring its
+/// `Content-Encoding`.
+///
+/// # Why this exists (the bug it fixes)
+/// Real providers (Anthropic, OpenAI) compress responses — almost always
+/// `content-encoding: gzip`, sometimes `br`/`deflate`. Our upstream client
+/// forwards the client's `accept-encoding` and returns the body **still
+/// compressed** (reqwest's auto-decompress features are intentionally off so the
+/// [relay][crate::server] stays byte-exact). If the recording path consumed those
+/// raw bytes, the stored `output` would be gzip garbage (`0x1f 0x8b …`) and the
+/// SSE reassembly + token/usage extraction would find no `data:`/JSON and yield
+/// nothing. So before *recording* we decode here; the relay still sends the
+/// original compressed bytes untouched.
+///
+/// Borrows the original bytes (zero-copy) for an empty body or an
+/// `identity`/absent/unknown encoding; allocates only when it actually decodes.
+/// Decoding **never panics**: on any decode error (or unrecognized encoding) it
+/// falls back to the raw bytes so the event still records *something*.
+///
+/// `Content-Encoding` may list multiple, comma-separated encodings applied in
+/// order (e.g. `gzip, br`); the *last* listed is the outermost / first to peel.
+/// We handle the common single-value case robustly and, for a list, attempt that
+/// last-applied encoding (a single decode pass), else fall back to raw — we do
+/// not chase arbitrarily nested stacks, which providers do not send.
+fn decoded_body(resp: &UpstreamResponse) -> Cow<'_, [u8]> {
+    let raw = resp.body.as_slice();
+    if raw.is_empty() {
+        return Cow::Borrowed(raw);
+    }
+    // Header names are already lowercased (see `UpstreamResponse`); the *value*
+    // (and any list members) still need lowercasing + trimming.
+    let Some(encoding) = resp.headers.get("content-encoding") else {
+        return Cow::Borrowed(raw);
+    };
+    // For a comma-listed value, the last entry is the outermost encoding (the
+    // last one applied), so that's the one to peel here.
+    let token = encoding
+        .rsplit(',')
+        .next()
+        .unwrap_or(encoding)
+        .trim()
+        .to_ascii_lowercase();
+
+    let decoded = match token.as_str() {
+        // No-ops: record the bytes as-is.
+        "" | "identity" => return Cow::Borrowed(raw),
+        // gzip: MultiGzDecoder tolerates concatenated members (a streamed gzip
+        // response can be several gzip frames), a robust superset of GzDecoder.
+        "gzip" | "x-gzip" => decode_with(flate2::read::MultiGzDecoder::new(raw)),
+        // `deflate` on the wire is usually zlib-wrapped; fall back to raw deflate.
+        "deflate" | "zlib" => decode_with(flate2::read::ZlibDecoder::new(raw))
+            .or_else(|| decode_with(flate2::read::DeflateDecoder::new(raw))),
+        "br" => decode_brotli(raw),
+        // Unknown/unsupported single token (e.g. `zstd`): don't guess.
+        _ => None,
+    };
+
+    match decoded {
+        Some(bytes) => Cow::Owned(bytes),
+        // Any decode failure (truncated/corrupt body, wrong declared encoding,
+        // unsupported token) records the raw bytes rather than panicking or
+        // dropping the event.
+        None => Cow::Borrowed(raw),
+    }
+}
+
+/// Run a `Read`-based decoder to completion, returning `None` on any I/O/decode
+/// error so the caller can fall back to the raw bytes.
+fn decode_with<R: Read>(mut decoder: R) -> Option<Vec<u8>> {
+    let mut out = Vec::new();
+    decoder.read_to_end(&mut out).ok().map(|_| out)
+}
+
+/// Brotli-decode `raw`, returning `None` on any decode error.
+fn decode_brotli(raw: &[u8]) -> Option<Vec<u8>> {
+    // `brotli::Decompressor` is a `Read` adapter over the compressed source; the
+    // 4096 is just the internal scratch buffer size, not a length cap.
+    decode_with(brotli::Decompressor::new(raw, 4096))
 }
 
 /// Parsed, provider-agnostic completion metadata extracted from a response.
@@ -82,12 +165,18 @@ pub fn record_llm_event(ctx: &HarnessContext, inputs: RecordInputs<'_>) -> Event
     // The recorded `stream` flag reflects whether streaming was *in play* — either
     // the client asked for it or the upstream replied with an event stream.
     let streamed = response.is_event_stream() || request.wants_stream();
+    // Decode the response body ONCE for recording, honoring `Content-Encoding`
+    // (gzip/deflate/br). Real providers reply compressed, and our upstream returns
+    // those bytes still compressed so the RELAY stays byte-exact — so everything
+    // the recording path reads from the body (SSE reassembly, JSON usage parsing,
+    // the stored `output` text) must run over the DECODED bytes, not `response.body`.
+    let body = decoded_body(response);
     // The parser choice, however, is driven by the RESPONSE shape only: a client
     // can ask for `stream:true` and still receive a buffered JSON body (the
     // provider ignored the flag, or it's a 4xx/5xx JSON error body). Keying the
     // reassembly off `request.wants_stream()` would run `reassemble_sse` on that
     // JSON, find no `data:` lines, and silently drop tokens/finish-reason/cost.
-    let meta = extract_completion_meta(response);
+    let meta = extract_completion_meta(response, &body);
 
     // Model: prefer the response's reported model, fall back to the request's.
     let model = meta
@@ -177,7 +266,7 @@ pub fn record_llm_event(ctx: &HarnessContext, inputs: RecordInputs<'_>) -> Event
     // response the raw (JSON) body is. Either way it is one complete string that
     // is redacted here BEFORE being attached — never a raw chunk.
     if ctx.captures(SensitivityClass::ToolResults) {
-        if let Some(body_text) = response_body_text(response, &meta) {
+        if let Some(body_text) = response_body_text(&body, &meta) {
             let (redacted, truncated) =
                 ctx.redact_text(SensitivityClass::ToolResults, &body_text);
             event.output = Some(serde_json::Value::String(redacted));
@@ -199,18 +288,20 @@ pub fn record_llm_event(ctx: &HarnessContext, inputs: RecordInputs<'_>) -> Event
 }
 
 /// The text to record as the response body: the reassembled completion text for
-/// a streamed response, otherwise the raw buffered body (as text). Returns
-/// `None` for an empty body. **Always** redacted by the caller before use.
-fn response_body_text(response: &UpstreamResponse, meta: &CompletionMeta) -> Option<String> {
+/// a streamed response, otherwise the (decoded) buffered body as text. `body` is
+/// the already-`Content-Encoding`-decoded response bytes (see [`decoded_body`]),
+/// so the recorded `output` is readable text, not gzip garbage. Returns `None`
+/// for an empty body. **Always** redacted by the caller before use.
+fn response_body_text(body: &[u8], meta: &CompletionMeta) -> Option<String> {
     if let Some(text) = &meta.reassembled_text {
         if !text.is_empty() {
             return Some(text.clone());
         }
     }
-    if response.body.is_empty() {
+    if body.is_empty() {
         return None;
     }
-    Some(String::from_utf8_lossy(&response.body).into_owned())
+    Some(String::from_utf8_lossy(body).into_owned())
 }
 
 /// The provider-relative operation verb for the event.
@@ -289,6 +380,11 @@ fn derive_cost(price: Option<ModelPrice>, input: Option<u64>, output: Option<u64
 
 /// Extract provider-agnostic completion metadata from a response.
 ///
+/// `body` is the already-`Content-Encoding`-decoded response body (see
+/// [`decoded_body`]) — a gzipped stream is the WHOLE SSE stream compressed, so it
+/// must be decoded BEFORE we reassemble, otherwise `reassemble_sse` sees binary
+/// and finds no `data:` lines. We parse `body`, not `response.body`.
+///
 /// The parser is chosen from the **response shape**, never the request: SSE is
 /// reassembled only when the upstream actually replied with an event stream
 /// (`response.is_event_stream()`); otherwise the buffered JSON body is parsed.
@@ -297,14 +393,23 @@ fn derive_cost(price: Option<ModelPrice>, input: Option<u64>, output: Option<u64
 /// Reassembling SSE over that JSON would find no `data:` lines and return a
 /// default (empty) meta, silently dropping the tokens/finish-reason/cost that
 /// are sitting right there in the body.
-fn extract_completion_meta(response: &UpstreamResponse) -> CompletionMeta {
+fn extract_completion_meta(response: &UpstreamResponse, body: &[u8]) -> CompletionMeta {
     if response.is_event_stream() {
-        reassemble_sse(&response.body)
-    } else if let Some(json) = response.body_json() {
+        reassemble_sse(body)
+    } else if let Some(json) = body_json(body) {
         meta_from_json(&json)
     } else {
         CompletionMeta::default()
     }
+}
+
+/// Best-effort parse of a (decoded) buffered JSON response body. Mirrors
+/// [`UpstreamResponse::body_json`] but over the decoded bytes.
+fn body_json(body: &[u8]) -> Option<serde_json::Value> {
+    if body.is_empty() {
+        return None;
+    }
+    serde_json::from_slice(body).ok()
 }
 
 /// Pull model / usage / finish-reason out of a buffered JSON completion body,
@@ -486,6 +591,30 @@ mod tests {
             status: 200,
             headers,
             body: body.as_bytes().to_vec(),
+        }
+    }
+
+    /// gzip-compress `bytes` the way a real provider would (so the test exercises
+    /// the actual decode path, not a hand-rolled stub).
+    fn gzip(bytes: &[u8]) -> Vec<u8> {
+        use flate2::write::GzEncoder;
+        use std::io::Write;
+        let mut enc = GzEncoder::new(Vec::new(), flate2::Compression::default());
+        enc.write_all(bytes).unwrap();
+        enc.finish().unwrap()
+    }
+
+    /// A response with a gzip-compressed body + `content-encoding: gzip`, of the
+    /// given content-type (so we can build both a gzipped JSON body and a gzipped
+    /// SSE stream — exactly what Anthropic/OpenAI return on the wire).
+    fn gzip_resp(status: u16, content_type: &str, plain_body: &[u8]) -> UpstreamResponse {
+        let mut headers = BTreeMap::new();
+        headers.insert("content-type".into(), content_type.into());
+        headers.insert("content-encoding".into(), "gzip".into());
+        UpstreamResponse {
+            status,
+            headers,
+            body: gzip(plain_body),
         }
     }
 
@@ -772,5 +901,120 @@ mod tests {
         assert_eq!(ev.status, Status::Error);
         assert_eq!(ev.error.as_deref(), Some("upstream status 429"));
         assert_eq!(ev.attributes.get("upstream_status"), Some(&serde_json::Value::from(429u16)));
+    }
+
+    #[test]
+    fn gzip_json_response_is_decoded_for_recording() {
+        // Regression for the dogfooding bug: a real provider returns the JSON
+        // completion body gzip-compressed (`content-encoding: gzip`). Before the
+        // fix, the recording path consumed the raw gzip bytes — the stored
+        // `output` started with the gzip magic (0x1f 0x8b) and token usage parsed
+        // to nothing. After the fix, the body is decoded first, so the recorded
+        // text is readable JSON and tokens/finish-reason are populated.
+        let ctx = ctx_with(CapturePolicy::default());
+        let request = req(br#"{"model":"claude-3","messages":[]}"#);
+        let plain = br#"{"model":"claude-3","usage":{"input_tokens":17,"output_tokens":8},"stop_reason":"end_turn"}"#;
+        let response = gzip_resp(200, "application/json", plain);
+
+        // Sanity: the body on the wire really is gzip (magic bytes), not plaintext.
+        assert_eq!(&response.body[..2], &[0x1f, 0x8b], "test body should be gzip");
+
+        let ev = record_llm_event(
+            &ctx,
+            RecordInputs {
+                provider: Provider::Anthropic,
+                request: &request,
+                response: &response,
+                price: None,
+                timestamp: MicrosTimestamp(1),
+                duration_ms: None,
+            },
+        );
+
+        // Token usage + finish-reason parsed out of the DECODED JSON.
+        let llm = ev.blocks.llm.as_ref().unwrap();
+        assert_eq!(llm.input_tokens, Some(17), "input tokens lost (body not decoded?)");
+        assert_eq!(llm.output_tokens, Some(8), "output tokens lost (body not decoded?)");
+        assert_eq!(llm.total_tokens, Some(25));
+        assert_eq!(llm.finish_reason.as_deref(), Some("end_turn"));
+        assert_eq!(llm.model.as_deref(), Some("claude-3"));
+
+        // The recorded `output` is the readable decoded text, NOT gzip bytes.
+        let out = ev.output.as_ref().unwrap().as_str().unwrap();
+        assert!(!out.starts_with('\u{1f}'), "output still looks like gzip: {out:?}");
+        assert!(out.contains("end_turn"), "decoded JSON not recorded: {out}");
+        assert!(out.contains("\"output_tokens\":8"), "decoded JSON not recorded: {out}");
+    }
+
+    #[test]
+    fn gzip_sse_stream_is_decoded_then_reassembled() {
+        // A streamed (text/event-stream) response that is ALSO gzip-compressed:
+        // the WHOLE stream is gzipped, so it must be decoded before SSE reassembly
+        // can find any `data:` lines. Asserts the completion text reassembled and
+        // usage/finish-reason came through from the decoded stream.
+        let ctx = ctx_with(CapturePolicy::default());
+        let request = req(br#"{"model":"gpt-4o","stream":true,"messages":[]}"#);
+        let stream = "data: {\"model\":\"gpt-4o\",\"choices\":[{\"delta\":{\"content\":\"Hel\"}}]}\n\n\
+                      data: {\"choices\":[{\"delta\":{\"content\":\"lo\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":4,\"completion_tokens\":2}}\n\n\
+                      data: [DONE]\n\n";
+        let response = gzip_resp(200, "text/event-stream", stream.as_bytes());
+
+        let ev = record_llm_event(
+            &ctx,
+            RecordInputs {
+                provider: Provider::OpenAi,
+                request: &request,
+                response: &response,
+                price: None,
+                timestamp: MicrosTimestamp(1),
+                duration_ms: None,
+            },
+        );
+
+        let llm = ev.blocks.llm.as_ref().unwrap();
+        assert_eq!(llm.stream, Some(true));
+        assert_eq!(llm.input_tokens, Some(4), "usage lost (gzipped stream not decoded?)");
+        assert_eq!(llm.output_tokens, Some(2));
+        assert_eq!(llm.finish_reason.as_deref(), Some("stop"));
+        // The reassembled completion text is recorded (decoded → reassembled).
+        let out = ev.output.as_ref().unwrap().as_str().unwrap();
+        assert_eq!(out, "Hello", "reassembled completion text wrong: {out}");
+    }
+
+    #[test]
+    fn decoded_body_passes_through_identity_and_unencoded() {
+        // No content-encoding ⇒ bytes unchanged (and borrowed, not copied).
+        let plain = json_resp(200, br#"{"ok":true}"#);
+        assert_eq!(decoded_body(&plain).as_ref(), &br#"{"ok":true}"#[..]);
+        assert!(matches!(decoded_body(&plain), Cow::Borrowed(_)));
+
+        // Explicit `identity` ⇒ also a no-op passthrough.
+        let mut identity = json_resp(200, b"hello");
+        identity.headers.insert("content-encoding".into(), "identity".into());
+        assert_eq!(decoded_body(&identity).as_ref(), &b"hello"[..]);
+
+        // Unknown encoding (e.g. zstd, which we don't decode) ⇒ raw bytes, no panic.
+        let mut zstd = json_resp(200, b"\x00\x01\x02");
+        zstd.headers.insert("content-encoding".into(), "zstd".into());
+        assert_eq!(decoded_body(&zstd).as_ref(), &b"\x00\x01\x02"[..]);
+    }
+
+    #[test]
+    fn decoded_body_falls_back_to_raw_on_corrupt_gzip() {
+        // content-encoding says gzip but the body is not valid gzip: decoding must
+        // not panic; it falls back to the raw bytes so the event still records.
+        let mut bad = json_resp(200, b"not actually gzip");
+        bad.headers.insert("content-encoding".into(), "gzip".into());
+        assert_eq!(decoded_body(&bad).as_ref(), &b"not actually gzip"[..]);
+    }
+
+    #[test]
+    fn decoded_body_uses_last_listed_encoding() {
+        // A comma-listed `content-encoding` (e.g. `identity, gzip`) means gzip was
+        // applied last / outermost, so that's what we peel. A single decode pass
+        // over a gzip body recovers the plaintext.
+        let mut resp = gzip_resp(200, "application/json", b"payload");
+        resp.headers.insert("content-encoding".into(), "identity, gzip".into());
+        assert_eq!(decoded_body(&resp).as_ref(), &b"payload"[..]);
     }
 }

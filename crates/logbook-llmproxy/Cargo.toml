@@ -26,7 +26,19 @@ tokio = { workspace = true, features = ["rt-multi-thread", "rt", "sync", "macros
 # Upstream HTTP client: reqwest over rustls (no OpenSSL), streaming bodies for
 # SSE reassembly. Used only by the real `ReqwestUpstream`; tests inject a mock
 # `Upstream` and never touch the network.
+#
+# NOTE: reqwest's gzip/brotli/deflate auto-decompress features are deliberately
+# left OFF so the RELAY to the client stays byte-exact (the client decompresses).
+# We therefore decode `Content-Encoding` ourselves, but ONLY for the recorded
+# copy, in `record::decoded_body` — see the deps just below.
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+# Response-body decompression for RECORDING only (never the relay). Real
+# providers return gzip/deflate (flate2) or brotli (brotli) bodies; `record`
+# decodes them so the stored `output` is readable text and token usage parses.
+# Crate-local like `reqwest`/`async-trait` above (promote to workspace deps if a
+# second crate needs them).
+flate2 = "1"
+brotli = "8"
 
 [dev-dependencies]
 tempfile = "3.27.0"
