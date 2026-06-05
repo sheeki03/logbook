@@ -343,6 +343,92 @@ impl Default for InventoryFindingsParams {
 }
 
 // ---------------------------------------------------------------------------
+// Session read-back lane (Phase 2 — "agent can query past sessions")
+// ---------------------------------------------------------------------------
+
+/// `session_list` — recent recorded `logbook agent <cli>` sessions (the
+/// `agent_sessions` index), newest-first, optionally filtered by agent.
+///
+/// Distinct from `inventory_list_sessions` (which is the inventory-lane view of
+/// the same table): the session read-back tools form a small, cohesive surface
+/// (`list`/`get`/`diff`/`search`) for the *agent-querying-its-own-history* use
+/// case, and `session_list` additionally annotates each row with its
+/// `action_count` and `has_transcript`, mirroring the UI master list.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct SessionListParams {
+    /// Restrict to a single agent (`claude`, `cursor`, ...). When omitted, all
+    /// agents are listed.
+    #[serde(default)]
+    pub agent: Option<String>,
+    /// Maximum number of sessions to return (newest-first).
+    #[serde(default = "default_limit")]
+    pub limit: u32,
+}
+
+impl Default for SessionListParams {
+    fn default() -> Self {
+        Self {
+            agent: None,
+            limit: DEFAULT_LIMIT,
+        }
+    }
+}
+
+/// `session_get` — one recorded session in full: the `agent_sessions` row, its
+/// `session_transcripts` pointer, its `agent_actions` (with redacted diffs), and
+/// the ordered events on the session's trace.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct SessionGetParams {
+    /// The session id (as listed by `session_list` / `inventory_list_sessions`).
+    pub session_id: String,
+    /// Maximum number of trace events to include (oldest-first). Defaults to
+    /// [`DEFAULT_LIMIT`] when omitted.
+    #[serde(default = "default_limit")]
+    pub event_limit: u32,
+}
+
+impl Default for SessionGetParams {
+    fn default() -> Self {
+        // Like the other limit-bearing params: a hand-written `Default` so
+        // `::default()` uses `DEFAULT_LIMIT`, never the `u32` zero (LIMIT 0).
+        Self {
+            session_id: String::new(),
+            event_limit: DEFAULT_LIMIT,
+        }
+    }
+}
+
+/// `session_diff` — the redacted per-file diffs (`agent_actions`) of one session.
+#[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
+pub struct SessionDiffParams {
+    /// The session id whose file diffs to return.
+    pub session_id: String,
+}
+
+/// `session_search` — full-text search (FTS5 MATCH) over the events and commands
+/// captured under a single session.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct SessionSearchParams {
+    /// The session id to scope the search to.
+    pub session_id: String,
+    /// FTS5 MATCH query (e.g. `connection refused`, `error AND timeout`).
+    pub query: String,
+    /// Maximum number of matching events to return.
+    #[serde(default = "default_limit")]
+    pub limit: u32,
+}
+
+impl Default for SessionSearchParams {
+    fn default() -> Self {
+        Self {
+            session_id: String::new(),
+            query: String::new(),
+            limit: DEFAULT_LIMIT,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Write-tool params (stubs in v1 — bodies live behind the permission gate)
 // ---------------------------------------------------------------------------
 

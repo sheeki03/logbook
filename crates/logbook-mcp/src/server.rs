@@ -311,6 +311,58 @@ impl LogbookServer {
         into_result(crate::tools::inventory_findings(&self.store, &params))
     }
 
+    /// Sessions: list recorded agent sessions.
+    #[tool(
+        name = "session_list",
+        description = "List recorded `logbook agent <cli>` sessions newest-first, annotated with action count and transcript presence; optionally filtered by agent.",
+        annotations(read_only_hint = true)
+    )]
+    pub async fn session_list(
+        &self,
+        Parameters(params): Parameters<SessionListParams>,
+    ) -> Result<CallToolResult, McpError> {
+        into_result(crate::tools::session_list(&self.store, &params))
+    }
+
+    /// Sessions: one session in full.
+    #[tool(
+        name = "session_get",
+        description = "Fetch one recorded session: its row, transcript pointer, diffed file actions, and the ordered events on its trace.",
+        annotations(read_only_hint = true)
+    )]
+    pub async fn session_get(
+        &self,
+        Parameters(params): Parameters<SessionGetParams>,
+    ) -> Result<CallToolResult, McpError> {
+        into_result(crate::tools::session_get(&self.store, &params))
+    }
+
+    /// Sessions: the redacted file diffs of a session.
+    #[tool(
+        name = "session_diff",
+        description = "Return the redacted per-file diffs (agent_actions) recorded for a session.",
+        annotations(read_only_hint = true)
+    )]
+    pub async fn session_diff(
+        &self,
+        Parameters(params): Parameters<SessionDiffParams>,
+    ) -> Result<CallToolResult, McpError> {
+        into_result(crate::tools::session_diff(&self.store, &params))
+    }
+
+    /// Sessions: FTS search within a session.
+    #[tool(
+        name = "session_search",
+        description = "Full-text search (FTS5 MATCH) over the events and commands captured under a single session.",
+        annotations(read_only_hint = true)
+    )]
+    pub async fn session_search(
+        &self,
+        Parameters(params): Parameters<SessionSearchParams>,
+    ) -> Result<CallToolResult, McpError> {
+        into_result(crate::tools::session_search(&self.store, &params))
+    }
+
     // ---- WRITE tools (gated; disabled unless enabled in logbook.toml) --
 
     /// Browser: navigate to a URL.
@@ -535,6 +587,10 @@ mod tests {
         "inventory_list_sessions",
         "inventory_report",
         "inventory_findings",
+        "session_list",
+        "session_get",
+        "session_diff",
+        "session_search",
     ];
 
     fn server_with(cfg_text: &str) -> LogbookServer {

@@ -16,6 +16,9 @@
 //! - **Debug:** `debug_fetch_evidence`.
 //! - **Inventory:** `inventory_list_agents`, `inventory_list_mcp`,
 //!   `inventory_list_sessions`, `inventory_report`, `inventory_findings`.
+//! - **Sessions (read-back):** `session_list`, `session_get`, `session_diff`,
+//!   `session_search` — so an agent can query past `logbook agent` sessions
+//!   ("what did the last run change?").
 //!
 //! The WRITE tools (browser navigate/record/replay/screenshot/start_session;
 //! DAP set_logpoint/enable_trace/start/end_session; `security_scan`,

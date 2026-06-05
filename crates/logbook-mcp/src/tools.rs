@@ -645,6 +645,229 @@ pub fn inventory_report(store: &Store) -> anyhow::Result<Value> {
 }
 
 // ===========================================================================
+// Session read-back lane (Phase 2 — "agent can query past sessions")
+//
+// Read-only tools so an agent can ask "what did the last run change?": list the
+// recorded `logbook agent` sessions, fetch one in full (row + transcript pointer
+// + diffed actions + ordered trace events), pull just the redacted file diffs,
+// or FTS-search within a session. All reads use bound params (no string
+// interpolation of inputs); diffs are already redacted at capture, so this lane
+// only ever surfaces redacted content.
+// ===========================================================================
+
+/// SELECT list for an `agent_sessions` row (shared by `session_list` /
+/// `session_get`). Column order matches [`session_row_json`].
+const AGENT_SESSION_COLS: &str =
+    "id, endpoint_id, agent, command, trace_id, started_at, ended_at, exit_code";
+
+/// Map an `agent_sessions` row (selected via [`AGENT_SESSION_COLS`]) to JSON.
+fn session_row_json(r: &rusqlite::Row<'_>) -> rusqlite::Result<Value> {
+    Ok(json!({
+        "id": r.get::<_, String>(0)?,
+        "endpoint_id": r.get::<_, Option<String>>(1)?,
+        "agent": r.get::<_, String>(2)?,
+        "command": r.get::<_, String>(3)?,
+        "trace_id": r.get::<_, Option<String>>(4)?,
+        "started_at": r.get::<_, i64>(5)?,
+        "ended_at": r.get::<_, Option<i64>>(6)?,
+        "exit_code": r.get::<_, Option<i64>>(7)?,
+    }))
+}
+
+/// Map an `agent_actions` row (with the V2 diff columns) to JSON. The diff body
+/// is the redacted, size-capped per-file diff; `diff_bytes > len(diff)` flags a
+/// truncated body (the UI renders a "truncated" badge), surfaced here as a
+/// `truncated` boolean so an agent doesn't have to recompute it.
+fn action_row_json(r: &rusqlite::Row<'_>) -> rusqlite::Result<Value> {
+    let diff: Option<String> = r.get(5)?;
+    let diff_bytes: Option<i64> = r.get(6)?;
+    // `diff_bytes` is the pre-truncation length; compare to the stored body len.
+    let truncated = match (&diff, diff_bytes) {
+        (Some(d), Some(n)) => n > d.len() as i64,
+        _ => false,
+    };
+    Ok(json!({
+        "id": r.get::<_, String>(0)?,
+        "kind": r.get::<_, String>(1)?,
+        "path": r.get::<_, Option<String>>(2)?,
+        "detail": r.get::<_, Option<String>>(3)?,
+        "observed_at": r.get::<_, i64>(4)?,
+        "diff": diff,
+        "diff_bytes": diff_bytes,
+        "truncated": truncated,
+        "post_hash": r.get::<_, Option<String>>(7)?,
+        "revert_safe": r.get::<_, i64>(8)? != 0,
+        "max_sensitivity": r.get::<_, Option<String>>(9)?,
+    }))
+}
+
+/// The redacted `agent_actions` (file diffs) for one session, observation-order
+/// (oldest-first). Shared by `session_get` and `session_diff`.
+fn read_session_actions(conn: &Connection, session_id: &str) -> rusqlite::Result<Vec<Value>> {
+    read_rows(
+        conn,
+        "SELECT id, kind, path, detail, observed_at, \
+                diff, diff_bytes, post_hash, revert_safe, max_sensitivity \
+         FROM agent_actions WHERE session_id = ?1 ORDER BY observed_at ASC, id ASC",
+        [session_id],
+        action_row_json,
+    )
+}
+
+/// `session_list` — recent recorded agent sessions, newest-first, each annotated
+/// with its diffed-action count and whether a transcript pointer exists.
+pub fn session_list(store: &Store, params: &SessionListParams) -> anyhow::Result<Value> {
+    let agent = params.agent.clone();
+    let limit = params.limit;
+    let rows = store.read(move |conn: &Connection| {
+        // Build the (optionally agent-filtered) base query with a bound param,
+        // then annotate each row with its action count + transcript presence via
+        // correlated subqueries. `limit` is a `u32` formatted into the SQL (not a
+        // user string), exactly like `inventory_list_sessions`.
+        let mut sql = format!(
+            "SELECT {AGENT_SESSION_COLS}, \
+                (SELECT COUNT(*) FROM agent_actions a WHERE a.session_id = s.id) AS action_count, \
+                (SELECT COUNT(*) FROM session_transcripts t WHERE t.session_id = s.id) AS transcript_count \
+             FROM agent_sessions s"
+        );
+        let mut binds: Vec<String> = Vec::new();
+        if let Some(a) = &agent {
+            sql.push_str(" WHERE s.agent = ?");
+            binds.push(a.clone());
+        }
+        sql.push_str(" ORDER BY s.started_at DESC LIMIT ");
+        sql.push_str(&limit.to_string());
+        let binds_ref: Vec<&dyn rusqlite::ToSql> =
+            binds.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
+        read_rows(conn, &sql, binds_ref.as_slice(), |r| {
+            let mut row = session_row_json(r)?;
+            let action_count: i64 = r.get(8)?;
+            let transcript_count: i64 = r.get(9)?;
+            if let Value::Object(map) = &mut row {
+                map.insert("action_count".into(), json!(action_count));
+                map.insert("has_transcript".into(), json!(transcript_count > 0));
+            }
+            Ok(row)
+        })
+        .map_err(logbook_store::StoreError::from)
+    })?;
+    Ok(ListResult::new(rows).into_value())
+}
+
+/// `session_get` — one session in full: the `agent_sessions` row, its
+/// `session_transcripts` pointer, its diffed `agent_actions`, and the ordered
+/// events on the session's trace (oldest-first, capped at `event_limit` via a
+/// bounded `Query`, so a large trace is never fully materialized). Returns
+/// `{ "found": false }` when the session id is unknown.
+pub fn session_get(store: &Store, params: &SessionGetParams) -> anyhow::Result<Value> {
+    let session_id = params.session_id.clone();
+    // 1. The session row + its transcript pointer + its actions, in one read so
+    //    they share a consistent snapshot. The trace id (for the events read
+    //    below) comes back out of the session row.
+    type SessionBundle = Option<(Value, Option<Value>, Vec<Value>, Option<String>)>;
+    let bundle: SessionBundle = store.read(move |conn: &Connection| {
+        let session: Option<Value> = conn
+            .query_row(
+                &format!("SELECT {AGENT_SESSION_COLS} FROM agent_sessions WHERE id = ?1 LIMIT 1"),
+                [&session_id],
+                session_row_json,
+            )
+            .map(Some)
+            .or_else(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                other => Err(logbook_store::StoreError::from(other)),
+            })?;
+        let Some(session) = session else {
+            return Ok(None);
+        };
+        let trace_id = session
+            .get("trace_id")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+
+        let transcript: Option<Value> = conn
+            .query_row(
+                "SELECT session_id, trace_id, terminal_log_path, text_path, \
+                        line_count, byte_size, max_sensitivity, created_at \
+                 FROM session_transcripts WHERE session_id = ?1 LIMIT 1",
+                [&session_id],
+                |r| {
+                    Ok(json!({
+                        "session_id": r.get::<_, String>(0)?,
+                        "trace_id": r.get::<_, String>(1)?,
+                        "terminal_log_path": r.get::<_, Option<String>>(2)?,
+                        "text_path": r.get::<_, Option<String>>(3)?,
+                        "line_count": r.get::<_, Option<i64>>(4)?,
+                        "byte_size": r.get::<_, Option<i64>>(5)?,
+                        "max_sensitivity": r.get::<_, String>(6)?,
+                        "created_at": r.get::<_, i64>(7)?,
+                    }))
+                },
+            )
+            .map(Some)
+            .or_else(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                other => Err(logbook_store::StoreError::from(other)),
+            })?;
+
+        let actions = read_session_actions(conn, &session_id)
+            .map_err(logbook_store::StoreError::from)?;
+        Ok(Some((session, transcript, actions, trace_id)))
+    })?;
+
+    let Some((session, transcript, actions, trace_id)) = bundle else {
+        return Ok(json!({ "found": false }));
+    };
+
+    // 2. The ordered trace events (oldest-first, the timeline reading order),
+    //    capped at `event_limit`. Empty when the session row has no trace yet.
+    //    The cap is pushed into the read as a SQL `LIMIT` (via `Query`), so we
+    //    never materialize a whole large trace just to throw most of it away —
+    //    only `event_limit` rows are ever loaded.
+    let events = match &trace_id {
+        Some(t) if !t.is_empty() => {
+            let q = Query::new()
+                .trace(t.clone())
+                .oldest_first()
+                .limit(params.event_limit);
+            let evs = store.query(&q)?;
+            events_to_values(&evs)
+        }
+        _ => Vec::new(),
+    };
+
+    Ok(json!({
+        "found": true,
+        "session": session,
+        "transcript": transcript,
+        "actions": ListResult::new(actions).into_value(),
+        "events": ListResult::new(events).into_value(),
+    }))
+}
+
+/// `session_diff` — just the redacted per-file diffs (`agent_actions`) of a
+/// session, observation-order. The bodies are already redacted at capture.
+pub fn session_diff(store: &Store, params: &SessionDiffParams) -> anyhow::Result<Value> {
+    let session_id = params.session_id.clone();
+    let rows = store.read(move |conn: &Connection| {
+        read_session_actions(conn, &session_id).map_err(logbook_store::StoreError::from)
+    })?;
+    Ok(ListResult::new(rows).into_value())
+}
+
+/// `session_search` — FTS5 search over the events/commands captured under one
+/// session. Reuses the store's [`Query`] (session filter ANDed with the FTS
+/// MATCH), so the search is scoped to exactly that session's rows.
+pub fn session_search(store: &Store, params: &SessionSearchParams) -> anyhow::Result<Value> {
+    let q = Query::new()
+        .session(params.session_id.clone())
+        .search(params.query.clone())
+        .limit(params.limit);
+    let events = store.query(&q)?;
+    Ok(ListResult::new(events_to_values(&events)).into_value())
+}
+
+// ===========================================================================
 // Write tools — v1 stubs (only reachable when the permission gate allows them)
 // ===========================================================================
 
@@ -759,6 +982,7 @@ mod tests {
     use logbook_core::{
         Category, ConsoleBlock, Event, Kind, MicrosTimestamp, NetworkBlock, SessionId, TraceId,
     };
+    use rusqlite::params;
 
     fn store_with_some_events() -> (Store, TraceId) {
         let store = Store::open_in_memory().unwrap();
@@ -1068,6 +1292,244 @@ mod tests {
         .unwrap();
         assert_eq!(out["session_id"], json!("dbg-1"));
         assert_eq!(out["count"], json!(1));
+    }
+
+    /// Seed a store with one agent session (`s1`) carrying: a trace with two
+    /// events (one of them FTS-matchable), a `session_transcripts` pointer, and
+    /// two `agent_actions` — one with a redacted diff whose `diff_bytes` exceeds
+    /// the stored body (a truncated diff), one a "diff omitted" marker. Plus a
+    /// second, action-less, transcript-less session (`s2`) for the list view.
+    /// Returns the shared trace hex of `s1`.
+    fn store_with_a_session() -> (Store, String) {
+        let store = Store::open_in_memory().unwrap();
+        let trace = TraceId::new();
+        let trace_hex = trace.to_hex();
+        let sess = SessionId::new("s1");
+        // Two events under the session's trace (one matches "refused").
+        store
+            .insert(
+                &Event::new(trace, Kind::Log, Category::AppLog, "stdout")
+                    .with_name("connection refused on port 8080")
+                    .with_session(sess.clone()),
+            )
+            .unwrap();
+        store
+            .insert(
+                &Event::new(trace, Kind::Log, Category::AppLog, "stdout")
+                    .with_name("everything is fine")
+                    .with_session(sess.clone()),
+            )
+            .unwrap();
+
+        let trace_for_rows = trace_hex.clone();
+        store
+            .write(move |conn| {
+                // The session row (shares the trace) + a second session.
+                conn.execute(
+                    "INSERT INTO agent_sessions (id, agent, command, trace_id, started_at, exit_code) \
+                     VALUES ('s1', 'claude', 'claude --do-thing', ?1, 100, 0)",
+                    params![trace_for_rows],
+                )?;
+                conn.execute(
+                    "INSERT INTO agent_sessions (id, agent, command, started_at) \
+                     VALUES ('s2', 'cursor', 'cursor edit', 50)",
+                    [],
+                )?;
+                // The transcript pointer for s1 only.
+                conn.execute(
+                    "INSERT INTO session_transcripts \
+                       (session_id, trace_id, terminal_log_path, text_path, line_count, byte_size, created_at) \
+                     VALUES ('s1', ?1, '/out/s1.terminal.log', '/out/s1.txt', 2, 4096, 100)",
+                    params![trace_for_rows],
+                )?;
+                // Action A: a redacted diff whose pre-truncation byte count
+                // (diff_bytes) exceeds the stored body length → truncated=true.
+                conn.execute(
+                    "INSERT INTO agent_actions \
+                       (id, session_id, kind, path, detail, observed_at, diff, diff_bytes, post_hash, revert_safe, max_sensitivity) \
+                     VALUES ('a1', 's1', 'file_modified', 'src/main.rs', NULL, 110, \
+                             '@@ -1 +1 @@ changed', 9999, 'deadbeef', 1, 'file_diffs')",
+                    [],
+                )?;
+                // Action B: a "diff omitted (size)" marker — no diff body.
+                conn.execute(
+                    "INSERT INTO agent_actions \
+                       (id, session_id, kind, path, detail, observed_at, diff, diff_bytes, post_hash, revert_safe, max_sensitivity) \
+                     VALUES ('a2', 's1', 'file_added', 'big.bin', 'changed, diff omitted (size)', 120, \
+                             NULL, NULL, NULL, 0, NULL)",
+                    [],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        (store, trace_hex)
+    }
+
+    #[test]
+    fn session_list_annotates_actions_and_transcript() {
+        let (store, _trace) = store_with_a_session();
+        let all = session_list(&store, &SessionListParams::default()).unwrap();
+        assert_eq!(all["count"], json!(2), "both sessions listed");
+        // Newest-first by started_at: s1 (100) before s2 (50).
+        assert_eq!(all["items"][0]["id"], json!("s1"));
+        assert_eq!(all["items"][0]["action_count"], json!(2));
+        assert_eq!(all["items"][0]["has_transcript"], json!(true));
+        assert_eq!(all["items"][1]["id"], json!("s2"));
+        assert_eq!(all["items"][1]["action_count"], json!(0));
+        assert_eq!(all["items"][1]["has_transcript"], json!(false));
+
+        // Agent filter narrows to one session.
+        let just_claude = session_list(
+            &store,
+            &SessionListParams { agent: Some("claude".into()), limit: 200 },
+        )
+        .unwrap();
+        assert_eq!(just_claude["count"], json!(1));
+        assert_eq!(just_claude["items"][0]["id"], json!("s1"));
+    }
+
+    #[test]
+    fn session_get_returns_row_transcript_actions_and_events() {
+        let (store, trace) = store_with_a_session();
+        let out = session_get(
+            &store,
+            &SessionGetParams { session_id: "s1".into(), event_limit: 200 },
+        )
+        .unwrap();
+        assert_eq!(out["found"], json!(true));
+        assert_eq!(out["session"]["id"], json!("s1"));
+        assert_eq!(out["session"]["trace_id"], json!(trace));
+        // Transcript pointer present.
+        assert_eq!(out["transcript"]["terminal_log_path"], json!("/out/s1.terminal.log"));
+        assert_eq!(out["transcript"]["line_count"], json!(2));
+        // Two diffed actions, observation-order; the first carries the redacted
+        // diff and is flagged truncated (diff_bytes 9999 > body len).
+        assert_eq!(out["actions"]["count"], json!(2));
+        assert_eq!(out["actions"]["items"][0]["id"], json!("a1"));
+        assert_eq!(out["actions"]["items"][0]["diff"], json!("@@ -1 +1 @@ changed"));
+        assert_eq!(out["actions"]["items"][0]["truncated"], json!(true));
+        assert_eq!(out["actions"]["items"][0]["revert_safe"], json!(true));
+        // The omitted-diff marker action has no body and is not truncated.
+        assert_eq!(out["actions"]["items"][1]["id"], json!("a2"));
+        assert_eq!(out["actions"]["items"][1]["diff"], json!(null));
+        assert_eq!(out["actions"]["items"][1]["truncated"], json!(false));
+        assert_eq!(out["actions"]["items"][1]["revert_safe"], json!(false));
+        // The ordered trace events (both events on s1's trace).
+        assert_eq!(out["events"]["count"], json!(2));
+
+        // An unknown session id → found:false.
+        let missing = session_get(
+            &store,
+            &SessionGetParams { session_id: "ghost".into(), event_limit: 200 },
+        )
+        .unwrap();
+        assert_eq!(missing["found"], json!(false));
+    }
+
+    #[test]
+    fn session_get_event_limit_caps_events() {
+        let (store, _trace) = store_with_a_session();
+        let out = session_get(
+            &store,
+            &SessionGetParams { session_id: "s1".into(), event_limit: 1 },
+        )
+        .unwrap();
+        assert_eq!(out["events"]["count"], json!(1), "event_limit caps the trace events");
+    }
+
+    #[test]
+    fn session_get_event_limit_is_a_bounded_read_oldest_first() {
+        // Regression: the cap is pushed into the read (SQL `LIMIT`), not applied
+        // by materializing the whole trace then truncating. On a trace with many
+        // more events than `event_limit`, `session_get` returns *exactly*
+        // `event_limit` rows, and they are the oldest ones in oldest-first order
+        // (the replay reading order) — which is only correct if the LIMIT is
+        // applied to an ASC-ordered read, not to a post-hoc `Vec::truncate`.
+        let store = Store::open_in_memory().unwrap();
+        let trace = TraceId::new();
+        let trace_hex = trace.to_hex();
+        let sess = SessionId::new("big");
+
+        // 10 events on the session's trace, timestamped 1_000, 2_000, … so the
+        // oldest-first ordering is unambiguous and verifiable by name.
+        const TOTAL: i64 = 10;
+        for i in 0..TOTAL {
+            let mut ev = Event::new(trace, Kind::Log, Category::AppLog, "stdout")
+                .with_name(format!("line-{i}"))
+                .with_session(sess.clone());
+            ev.timestamp = MicrosTimestamp(1_000 * (i + 1));
+            store.insert(&ev).unwrap();
+        }
+
+        let trace_for_row = trace_hex.clone();
+        store
+            .write(move |conn| {
+                conn.execute(
+                    "INSERT INTO agent_sessions (id, agent, command, trace_id, started_at, exit_code) \
+                     VALUES ('big', 'claude', 'claude --do-thing', ?1, 100, 0)",
+                    params![trace_for_row],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+
+        // Cap well below the 10 stored events.
+        let limit = 3u32;
+        let out = session_get(
+            &store,
+            &SessionGetParams { session_id: "big".into(), event_limit: limit },
+        )
+        .unwrap();
+
+        // Exactly `event_limit` rows come back — not all 10.
+        assert_eq!(
+            out["events"]["count"],
+            json!(limit),
+            "event_limit caps the read to exactly that many rows"
+        );
+        let items = out["events"]["items"].as_array().expect("events array");
+        assert_eq!(items.len(), limit as usize);
+        // And they are the OLDEST `limit` events, in oldest-first order. A whole
+        // trace fetched newest-first then truncated would have yielded the
+        // newest rows / wrong order; the bounded oldest-first read yields these.
+        assert_eq!(items[0]["name"], json!("line-0"));
+        assert_eq!(items[1]["name"], json!("line-1"));
+        assert_eq!(items[2]["name"], json!("line-2"));
+    }
+
+    #[test]
+    fn session_diff_returns_only_the_diffs() {
+        let (store, _trace) = store_with_a_session();
+        let out = session_diff(&store, &SessionDiffParams { session_id: "s1".into() }).unwrap();
+        assert_eq!(out["count"], json!(2));
+        assert_eq!(out["items"][0]["path"], json!("src/main.rs"));
+        assert_eq!(out["items"][0]["diff"], json!("@@ -1 +1 @@ changed"));
+        assert_eq!(out["items"][1]["detail"], json!("changed, diff omitted (size)"));
+
+        // A session with no actions → empty list, not an error.
+        let none = session_diff(&store, &SessionDiffParams { session_id: "s2".into() }).unwrap();
+        assert_eq!(none["count"], json!(0));
+    }
+
+    #[test]
+    fn session_search_is_scoped_to_the_session() {
+        let (store, _trace) = store_with_a_session();
+        // "refused" matches the one event under s1.
+        let hit = session_search(
+            &store,
+            &SessionSearchParams { session_id: "s1".into(), query: "refused".into(), limit: 200 },
+        )
+        .unwrap();
+        assert_eq!(hit["count"], json!(1));
+        assert!(hit["items"][0]["name"].as_str().unwrap().contains("refused"));
+
+        // The same term scoped to s2 (which has no events) → nothing.
+        let miss = session_search(
+            &store,
+            &SessionSearchParams { session_id: "s2".into(), query: "refused".into(), limit: 200 },
+        )
+        .unwrap();
+        assert_eq!(miss["count"], json!(0));
     }
 
     #[test]

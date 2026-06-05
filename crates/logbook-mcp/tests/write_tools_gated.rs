@@ -13,7 +13,7 @@ use logbook_mcp::config::{all_write_tools, WriteCategory};
 use logbook_mcp::{server_from_root, LogbookServer, McpConfig};
 use logbook_store::Store;
 
-/// The 21 read tools that must always be advertised.
+/// The 25 read tools that must always be advertised.
 const READ_TOOLS: &[&str] = &[
     "list_log_files",
     "tail_log",
@@ -36,6 +36,10 @@ const READ_TOOLS: &[&str] = &[
     "inventory_list_sessions",
     "inventory_report",
     "inventory_findings",
+    "session_list",
+    "session_get",
+    "session_diff",
+    "session_search",
 ];
 
 fn server_for(cfg_text: Option<&str>) -> LogbookServer {
