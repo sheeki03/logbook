@@ -222,6 +222,20 @@ mod tests {
         conn
     }
 
+    /// Open a connection and apply migrations only up to V3 — leaving the DB in
+    /// the exact pre-V4 shape (the `audit_log` table absent). Refinery records
+    /// V1+V2+V3, so a later full run applies *only* V4 (the genuine V3→V4 upgrade
+    /// path, not a fresh build).
+    fn open_at_v3(path: &Path) -> Connection {
+        let mut conn = Connection::open(path).unwrap();
+        configure_connection(&conn).unwrap();
+        embedded::migrations::runner()
+            .set_target(Target::Version(3))
+            .run(&mut conn)
+            .unwrap();
+        conn
+    }
+
     #[test]
     fn v2_migration_is_incremental_and_idempotent_on_a_v1_db() {
         let dir = tempfile::tempdir().unwrap();
@@ -410,8 +424,9 @@ mod tests {
 
     #[test]
     fn fresh_db_runs_all_migrations() {
-        // A from-scratch open applies V1+V2+V3 in one go; the full surface is
-        // present (V2 capture-policy columns/table + the V3 `events.turn`).
+        // A from-scratch open applies V1+V2+V3+V4 in one go; the full surface is
+        // present (V2 capture-policy columns/table + the V3 `events.turn` + the
+        // V4 `audit_log` table).
         let dir = tempfile::tempdir().unwrap();
         let mut conn = Connection::open(dir.path().join("fresh.db")).unwrap();
         configure_connection(&conn).unwrap();
@@ -420,6 +435,75 @@ mod tests {
         assert!(has_column(&conn, "agent_actions", "revert_safe"));
         assert!(has_table(&conn, "session_transcripts"));
         assert!(has_column(&conn, "events", "turn"), "V3 events.turn present");
+        assert!(has_table(&conn, "audit_log"), "V4 audit_log present");
+    }
+
+    #[test]
+    fn v4_migration_is_incremental_and_idempotent_on_a_v3_db() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("logbook.db");
+
+        // (1) Build a V3-shaped DB and assert the V4 `audit_log` table is ABSENT.
+        let conn = open_at_v3(&db);
+        assert!(
+            has_column(&conn, "events", "turn"),
+            "sanity: V3 surface is present"
+        );
+        assert!(
+            !has_table(&conn, "audit_log"),
+            "audit_log must not exist at V3"
+        );
+        drop(conn);
+
+        // (2) Reopen at the latest target → refinery applies ONLY V4 on top.
+        let mut conn = Connection::open(&db).unwrap();
+        configure_connection(&conn).unwrap();
+        run_migrations(&mut conn).unwrap();
+
+        // V4 table + its event_id index now exist.
+        assert!(has_table(&conn, "audit_log"));
+        let idx: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM sqlite_master \
+                 WHERE type='index' AND name='idx_audit_log_event_id'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(idx, 1, "idx_audit_log_event_id must exist after V4");
+
+        // (3) The AUTOINCREMENT seq is monotonic and bound params round-trip.
+        conn.execute(
+            "INSERT INTO audit_log (event_id, prev_hash, row_hash, created_at) \
+             VALUES ('ev-1', 'p', 'h1', 10)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO audit_log (event_id, prev_hash, row_hash, created_at) \
+             VALUES ('ev-2', 'h1', 'h2', 20)",
+            [],
+        )
+        .unwrap();
+        let (s1, s2): (i64, i64) = (
+            conn.query_row(
+                "SELECT seq FROM audit_log WHERE event_id='ev-1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap(),
+            conn.query_row(
+                "SELECT seq FROM audit_log WHERE event_id='ev-2'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap(),
+        );
+        assert!(s2 > s1, "seq is strictly increasing");
+
+        // (4) Running migrations again is a no-op (refinery skips applied).
+        run_migrations(&mut conn).unwrap();
+        assert!(has_table(&conn, "audit_log"));
     }
 
     #[test]

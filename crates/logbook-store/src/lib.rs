@@ -30,6 +30,7 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+pub mod audit;
 pub mod error;
 pub mod jsonl;
 pub mod query;
@@ -44,6 +45,10 @@ use rusqlite::Connection;
 
 use logbook_core::{CapturePolicy, Event};
 
+pub use audit::{
+    append_audit, canonical_json, hub_receive, verify_chain, AuditBreak, AuditVerification,
+    BreakReason, GENESIS_HASH,
+};
 pub use error::{Result, StoreError};
 pub use jsonl::{read_jsonl, read_jsonl_opt, JsonlWriter, JSONL_FILENAME};
 pub use query::{
@@ -198,6 +203,55 @@ impl Store {
         let session_id = session_id.to_string();
         self.inner
             .read(move |conn| retention::session_tree(conn, &session_id))
+    }
+
+    /// Append one tamper-evidence audit-log row for `event`, extending the
+    /// hash chain (plan "Phase 4 — Complete Tier & Fleet" → hash-chain audit),
+    /// and return the new `row_hash`. The row links to the current chain tail
+    /// (genesis = [`GENESIS_HASH`]) via
+    /// `row_hash = hex(sha256(prev_hash || canonical_json(event)))` over the
+    /// event's canonical, **already-redacted** JSON.
+    ///
+    /// This attests that a stored, redacted row was not altered/removed *after*
+    /// it was recorded; it does **not** prove raw secrets were never captured
+    /// before redaction (redaction runs upstream at capture). See
+    /// [`audit`](crate::audit) for the full integrity model.
+    ///
+    /// # Errors
+    /// Returns a [`StoreError`] if canonicalization or the insert fails, or the
+    /// writer is gone.
+    pub fn append_audit(&self, event: &Event) -> Result<String> {
+        let event = event.clone();
+        self.inner
+            .write_with(move |conn| crate::audit::append_audit(conn, &event))
+    }
+
+    /// Recompute the hash chain from the current stored event bodies in `seq`
+    /// order and report the first break ([`AuditVerification`]). Mutating or
+    /// deleting an audited event's stored body makes verification fail at that
+    /// row (plan "P4 tests": "mutating an audited row breaks chain
+    /// verification"). Reads only; an empty chain verifies cleanly.
+    ///
+    /// # Errors
+    /// Returns a [`StoreError`] if the read or a body deserialization fails.
+    pub fn verify_chain(&self) -> Result<AuditVerification> {
+        self.inner.read(crate::audit::verify_chain)
+    }
+
+    /// Idempotently receive a batch of forwarded `events` by id (the fleet
+    /// receiver's upsert-by-id path, plan "Phase 4 — Complete Tier & Fleet" →
+    /// Hub). Inserts each event with `INSERT OR IGNORE` on the `events.id`
+    /// primary key — re-receiving an already-present id is a no-op that
+    /// preserves the local copy — and returns how many rows were **newly**
+    /// inserted. Forwarded events are already-redacted on their origin plane.
+    ///
+    /// # Errors
+    /// Returns a [`StoreError`] if a row fails to serialize, the insert
+    /// transaction fails (the whole batch rolls back), or the writer is gone.
+    pub fn hub_receive(&self, events: &[Event]) -> Result<usize> {
+        let events = events.to_vec();
+        self.inner
+            .write_with(move |conn| crate::audit::hub_receive(conn, &events))
     }
 
     /// Enforce retention against the `events` table (plan §3): a per-class age

@@ -19,6 +19,8 @@ tracing = { workspace = true }
 # which requires rusqlite ">=0.23, <=0.38". `bundled` compiles SQLite in-tree.
 rusqlite = { version = "0.38", features = ["bundled"] }
 refinery = { version = "0.9", features = ["rusqlite"] }
+# Phase 4 hash-chain audit: SHA-256 over canonical, already-redacted event JSON.
+sha2 = "0.10"
 
 [dev-dependencies]
 tempfile = "3.27.0"
