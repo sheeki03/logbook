@@ -47,6 +47,8 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::capture_policy::CapturePolicy;
+
 /// The conventional config filename, resolved against a workspace / out-dir
 /// root.
 pub const CONFIG_FILENAME: &str = "logbook.toml";
@@ -70,6 +72,10 @@ pub struct LogbookConfig {
     pub retention: Retention,
     /// `[scanners]` — security scanner binary names/paths.
     pub scanners: Scanners,
+    /// `[capture]` — Orbit capture policy + per-sensitivity-class rules. Absent
+    /// (or absent file) yields the **recorder-on** [`CapturePolicy::default`];
+    /// see [`crate::capture_policy`] for the fail-closed load semantics.
+    pub capture: CapturePolicy,
 }
 
 /// The `[permissions]` table (plan §9.1). All fields default to the strictest,

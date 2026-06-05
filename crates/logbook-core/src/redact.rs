@@ -194,6 +194,13 @@ struct Span {
 #[derive(Debug)]
 pub struct Redactor {
     enabled: bool,
+    /// The **mandatory secrets floor** flag. When `true` the built-in secret
+    /// rules (cloud keys, JWT, bearer, PEM, cookie, URL password) and any
+    /// registered env-literals run **even when `enabled` is `false`** — this is
+    /// the layer that `--no-redact` / `[redaction].enabled=false` can *never*
+    /// switch off. A floor redactor carries no user `deny` patterns (those are
+    /// general-tier), so it scrubs exactly the secret floor.
+    floor: bool,
     /// Literal secret values (e.g. from the environment) to scrub verbatim,
     /// longest-first so we never redact a prefix of a longer secret.
     literals: Vec<(String, SecretKind)>,
@@ -216,6 +223,7 @@ impl Redactor {
     pub fn new() -> Self {
         Self {
             enabled: true,
+            floor: false,
             literals: Vec::new(),
             deny: Vec::new(),
             allow: Vec::new(),
@@ -224,20 +232,64 @@ impl Redactor {
 
     /// A disabled redactor — [`Redactor::redact`] returns input unchanged.
     /// Intended only for `--no-redact` (which should warn at the call site).
+    ///
+    /// Note this disables the **general** redactor only; the secrets floor lives
+    /// in a separate [`Redactor::secrets_floor`] redactor that callers run
+    /// regardless (see [`scrub_secrets`]).
     #[must_use]
     pub fn disabled() -> Self {
         Self {
             enabled: false,
+            floor: false,
             literals: Vec::new(),
             deny: Vec::new(),
             allow: Vec::new(),
         }
     }
 
-    /// Whether redaction is active.
+    /// The **mandatory secrets-floor redactor** (plan: "Secrets floor is
+    /// independent of the global switch").
+    ///
+    /// It runs **only** the built-in secret patterns — cloud keys, JWT,
+    /// bearer/Authorization tokens, PEM private-key blocks, cookies, and URL
+    /// passwords — plus any env-derived literals registered via
+    /// [`Redactor::with_env_secrets`] / [`Redactor::with_process_env`]. It is
+    /// **always active**: unlike [`Redactor::new`], it cannot be disabled, so a
+    /// `RedactionMode::Always` class (or a `--no-redact` caller) still gets at
+    /// least this floor. It deliberately accepts **no** user `deny` patterns
+    /// (those are general-tier and could be misconfigured); allow-list
+    /// exclusions are still honoured to suppress false positives.
+    #[must_use]
+    pub fn secrets_floor() -> Self {
+        Self {
+            enabled: true,
+            floor: true,
+            literals: Vec::new(),
+            deny: Vec::new(),
+            allow: Vec::new(),
+        }
+    }
+
+    /// A secrets-floor redactor seeded with the current process environment's
+    /// secret-looking variables — the convenience the capture path uses so the
+    /// exact running-process secrets are scrubbed even under `--no-redact`.
+    #[must_use]
+    pub fn secrets_floor_with_process_env() -> Self {
+        Self::secrets_floor().with_process_env()
+    }
+
+    /// Whether redaction is active. Always `true` for a
+    /// [`Redactor::secrets_floor`] (the floor cannot be disabled); otherwise the
+    /// general `[redaction].enabled` switch.
     #[must_use]
     pub fn is_enabled(&self) -> bool {
-        self.enabled
+        self.enabled || self.floor
+    }
+
+    /// Whether this is the mandatory secrets-floor redactor (cannot be disabled).
+    #[must_use]
+    pub fn is_secrets_floor(&self) -> bool {
+        self.floor
     }
 
     /// Register literal secret values derived from environment variables whose
@@ -315,7 +367,9 @@ impl Redactor {
     /// otherwise.
     #[must_use]
     pub fn redact<'a>(&self, input: &'a str) -> Cow<'a, str> {
-        if !self.enabled {
+        // A floor redactor runs even when `enabled` is false — that is the whole
+        // point of the secrets floor. The general redactor honours `enabled`.
+        if !self.enabled && !self.floor {
             return Cow::Borrowed(input);
         }
 
@@ -380,7 +434,7 @@ impl Redactor {
     /// values, array elements, and top-level strings). Object **keys** are left
     /// intact. Used for `/ingest` payloads and MCP-config scans.
     pub fn redact_json(&self, value: &mut serde_json::Value) {
-        if !self.enabled {
+        if !self.enabled && !self.floor {
             return;
         }
         match value {
@@ -474,6 +528,19 @@ pub fn from_config<S: AsRef<str>>(
     };
     base.with_deny_patterns(deny.iter().map(AsRef::as_ref))
         .map(|r| r.with_allow(allow.iter().map(AsRef::as_ref)))
+}
+
+/// Scrub **secrets only** from `input`, applying the mandatory floor
+/// ([`Redactor::secrets_floor`]) regardless of `[redaction].enabled` /
+/// `--no-redact`.
+///
+/// This is the helper a caller uses when the *general* redactor is disabled but
+/// the secrets floor must still apply (the plan's "force-redact even under
+/// `--no-redact`" rule). It seeds the floor with the current process
+/// environment so the exact running-process secrets are caught too.
+#[must_use]
+pub fn scrub_secrets(input: &str) -> Cow<'_, str> {
+    Redactor::secrets_floor_with_process_env().redact(input)
 }
 
 /// Group the env vars whose names look secret into a name→value map. Useful for
@@ -708,5 +775,51 @@ mod tests {
         let mut s = String::from("Bearer abcDEF123456ghiJKL");
         r.redact_in_place(&mut s);
         assert!(!s.contains("abcDEF123456ghiJKL"));
+    }
+
+    #[test]
+    fn secrets_floor_is_always_enabled() {
+        let f = Redactor::secrets_floor();
+        assert!(f.is_enabled(), "floor cannot be disabled");
+        assert!(f.is_secrets_floor());
+        // A plain disabled redactor is the general kind, not the floor.
+        assert!(!Redactor::disabled().is_secrets_floor());
+    }
+
+    #[test]
+    fn secrets_floor_redacts_cloud_key_and_keeps_clean_text() {
+        // The floor scrubs secrets even though the *general* switch is off.
+        let f = Redactor::secrets_floor();
+        let out = f.redact("token AKIAIOSFODNN7EXAMPLE and plainword stays");
+        assert!(!out.contains("AKIAIOSFODNN7EXAMPLE"), "secret leaked under floor: {out}");
+        assert!(out.contains("REDACTED:CLOUD_KEY:"), "got: {out}");
+        // A non-secret string is untouched (the floor is secrets-only).
+        assert!(out.contains("plainword stays"), "over-redacted: {out}");
+    }
+
+    #[test]
+    fn scrub_secrets_helper_redacts_under_disabled_general_redactor() {
+        // Even when a caller would otherwise use a disabled general redactor,
+        // scrub_secrets still removes a planted secret.
+        let general = Redactor::disabled();
+        let input = "leak AKIAIOSFODNN7EXAMPLE in a --no-redact run";
+        assert_eq!(general.redact(input), input, "general redactor is a passthrough");
+        let scrubbed = scrub_secrets(input);
+        assert!(!scrubbed.contains("AKIAIOSFODNN7EXAMPLE"), "floor must scrub: {scrubbed}");
+        assert!(scrubbed.contains("REDACTED:CLOUD_KEY:"));
+        // Non-secret text is preserved.
+        assert!(scrubbed.contains("--no-redact run"));
+    }
+
+    #[test]
+    fn secrets_floor_covers_jwt_bearer_pem() {
+        let f = Redactor::secrets_floor();
+        let jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.sigpartHEREok";
+        assert!(!f.redact(jwt).contains(jwt), "jwt should be scrubbed by floor");
+        assert!(f
+            .redact("Authorization: Bearer abcDEF123456ghiJKL")
+            .contains("REDACTED:BEARER:"));
+        let pem = "-----BEGIN RSA PRIVATE KEY-----\nMIIabc\n-----END RSA PRIVATE KEY-----";
+        assert!(f.redact(pem).contains("REDACTED:PEM:"));
     }
 }

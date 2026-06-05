@@ -27,6 +27,7 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+pub mod capture_policy;
 pub mod config;
 pub mod error;
 pub mod event;
@@ -38,6 +39,10 @@ pub mod time;
 
 // Flat re-exports for the common surface so downstream crates can
 // `use logbook_core::{Event, TraceId, Redactor, ...}`.
+pub use capture_policy::{
+    CapturePolicy, CaptureState, CaptureStateClasses, ClassRule, ClassRules, CliOverlay,
+    RedactionMode, SensitivityClass, Tiers, CAPTURE_STATE_FILENAME,
+};
 pub use config::{LogbookConfig, CONFIG_FILENAME, INVENTORY_WATCH_WRITE};
 pub use error::{CoreError, Result};
 pub use event::{
