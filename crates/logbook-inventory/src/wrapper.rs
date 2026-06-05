@@ -31,7 +31,7 @@
 //! available** and returns a clear error.
 
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 
 use logbook_core::{CapturePolicy, Redactor, SensitivityClass, SessionId, TraceId};
@@ -185,8 +185,11 @@ pub async fn run_agent(
 
     // Whether the tree is clean at session start: clean ⇒ git itself is the
     // preimage ⇒ revert_safe. Computed before the run so a session that *makes*
-    // the tree dirty is still scored against its start state.
-    let clean_at_start = git_tree_is_clean(&opts.cwd);
+    // the tree dirty is still scored against its start state. logbook's own
+    // out-dir (the default `.logbook` lives inside the repo) is excluded so that
+    // creating the store does not make the tree look dirty and wrongly flip the
+    // session to revert_safe=false.
+    let clean_at_start = git_tree_is_clean(&opts.cwd, &opts.out_dir);
 
     // `--reversible` (encrypted dirty-tree preimages) is not yet implemented; a
     // dirty tree that asks for it must fail loudly rather than silently fall back
@@ -199,7 +202,7 @@ pub async fn run_agent(
     // Skipped entirely when diff capture is off (or the child won't be spawned).
     let capture_diffs = opts.spawn && opts.policy.should_capture(SensitivityClass::FileDiffs);
     let before = if capture_diffs {
-        build_redacted_baseline(&opts.cwd, redactor)
+        build_redacted_baseline(&opts.cwd, &opts.out_dir, redactor)
     } else {
         RedactedBaseline::default()
     };
@@ -229,7 +232,7 @@ pub async fn run_agent(
 
     // Teardown: re-snapshot and diff redacted-start → redacted-end per file.
     let actions = if capture_diffs {
-        let after = build_redacted_baseline(&opts.cwd, redactor);
+        let after = build_redacted_baseline(&opts.cwd, &opts.out_dir, redactor);
         diff_redacted_baselines(&before, &after, ended_at, clean_at_start, &opts.policy, redactor)
     } else {
         Vec::new()
@@ -278,19 +281,36 @@ struct RedactedBaseline {
 /// Each file's content is read, redacted in memory, and held keyed by path,
 /// bounded by [`PER_FILE_BASELINE_CAP`] per file and [`TOTAL_BASELINE_CAP`] in
 /// total. `.gitignore`d trees (`node_modules`/`target`) are excluded because the
-/// file list comes from `git ls-files --exclude-standard`. Returns an empty
-/// baseline when `cwd` is not a git repo or git is unavailable.
+/// file list comes from `git ls-files --exclude-standard`. Files inside logbook's
+/// own `out_dir` (the default `.logbook` lives inside the repo and is
+/// untracked-not-ignored, so `git ls-files --others` would otherwise list its
+/// store files) are excluded too, so logbook never records its own store as an
+/// agent file change. Returns an empty baseline when `cwd` is not a git repo or
+/// git is unavailable.
 ///
 /// Raw file content never leaves this function: only the redacted content (and a
 /// hash of it) is retained, and nothing is written to disk.
-fn build_redacted_baseline(cwd: &Path, redactor: &Redactor) -> RedactedBaseline {
+fn build_redacted_baseline(cwd: &Path, out_dir: &Path, redactor: &Redactor) -> RedactedBaseline {
     let mut baseline = RedactedBaseline::default();
     let files = match git_listed_files(cwd) {
         Some(f) => f,
         None => return baseline,
     };
+    // `git ls-files` paths are relative to `cwd` (git emits them relative to the
+    // directory it ran in), so exclude using the canonicalized `cwd` as the base.
+    // When the out-dir resolves outside `cwd` nothing matches (nothing to exclude).
+    let out_dir_abs = resolved_out_dir_abs(cwd, out_dir);
+    let cwd_canon = cwd.canonicalize().ok();
     let mut total_held: u64 = 0;
     for rel in files {
+        // Skip logbook's own store files (e.g. `.logbook/events.jsonl`) so they
+        // are never mistaken for agent edits. Compared by path components against
+        // the resolved out-dir, not a raw string prefix.
+        if let (Some(out_dir_abs), Some(base)) = (out_dir_abs.as_deref(), cwd_canon.as_deref()) {
+            if path_is_under(base, &rel, out_dir_abs) {
+                continue;
+            }
+        }
         let full = cwd.join(&rel);
         let meta = match std::fs::metadata(&full) {
             Ok(m) if m.is_file() => m,
@@ -639,15 +659,110 @@ fn stable_hash_bytes(raw: &[u8]) -> String {
     format!("{:016x}{:016x}", h1.finish(), h2.finish())
 }
 
+/// Lexically resolve `.`/`..` components in `p` **without** touching the
+/// filesystem (so it works for paths that no longer exist, e.g. a file the
+/// session deleted). Used to compare a candidate path against logbook's own
+/// out-dir by path *components* — never a raw string prefix, so a sibling like
+/// `.logbook-notes.txt` is not mistaken for being inside `.logbook/`.
+fn lexical_normalize(p: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for c in p.components() {
+        match c {
+            Component::ParentDir => {
+                out.pop();
+            }
+            Component::CurDir => {}
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
+
+/// Resolve logbook's own out-dir to a normalized **absolute** path for exclusion
+/// comparisons (plan: never record logbook's own store as an agent change).
+///
+/// `out_dir` may be relative (the default `.logbook`, relative to `cwd`) or
+/// absolute. It is resolved against the **canonicalized** `cwd` (canonicalizing
+/// the base once collapses platform symlinks like macOS `/var`→`/private/var` so a
+/// later `starts_with` against an equally-canonicalized listed path matches), then
+/// lexically normalized. Returns `None` only when `cwd` itself cannot be
+/// canonicalized (it always exists in practice), in which case callers simply skip
+/// exclusion.
+fn resolved_out_dir_abs(cwd: &Path, out_dir: &Path) -> Option<PathBuf> {
+    let base = cwd.canonicalize().ok()?;
+    let joined = if out_dir.is_absolute() {
+        out_dir.to_path_buf()
+    } else {
+        base.join(out_dir)
+    };
+    // Canonicalize so symlinks (e.g. macOS `/tmp`→`/private/tmp`) resolve the same way
+    // as the canonicalized bases used in `path_is_under`; fall back to a lexical
+    // normalize when the out-dir does not yet exist on disk.
+    Some(joined.canonicalize().unwrap_or_else(|_| lexical_normalize(&joined)))
+}
+
+/// Whether the repo-relative (or cwd-relative) `rel` path resolves to a location
+/// **inside** `out_dir_abs`, given the already-canonicalized `base` it is relative
+/// to (`cwd` for `git ls-files` output, the repo root for `git status` output).
+///
+/// The candidate is joined onto the canonicalized `base` and lexically normalized,
+/// then compared component-wise via [`Path::starts_with`] (not string prefix), so
+/// `.logbook-notes.txt` is correctly *not* treated as under `.logbook/`. Works for
+/// non-existent paths (deleted files) because no filesystem access is needed.
+fn path_is_under(base: &Path, rel: &str, out_dir_abs: &Path) -> bool {
+    let abs = lexical_normalize(&base.join(rel));
+    abs.starts_with(out_dir_abs)
+}
+
+/// Best-effort canonicalized repo root for `cwd` via `git rev-parse
+/// --show-toplevel`. `git status --porcelain` emits paths relative to the repo
+/// root (not `cwd`), so out-dir exclusion on those entries must join against the
+/// root, which may differ from `cwd` when `cwd` is a subdirectory. Returns `None`
+/// when `cwd` is not a repo or git is unavailable (callers then skip exclusion —
+/// the tree is simply scored as-is).
+fn git_repo_root(cwd: &Path) -> Option<PathBuf> {
+    let out = Command::new("git")
+        .args(["rev-parse", "--show-toplevel"])
+        .current_dir(cwd)
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let root = String::from_utf8_lossy(&out.stdout);
+    let root = root.trim();
+    if root.is_empty() {
+        return None;
+    }
+    // Canonicalize so it collapses platform symlinks the same way the out-dir base
+    // does, keeping the two sides of `starts_with` comparable.
+    Path::new(root).canonicalize().ok()
+}
+
 /// Whether the git working tree under `cwd` is clean (no staged or unstaged
-/// changes, no untracked-not-ignored files) at session start. A clean tree means
-/// git itself is the preimage, so the session's diff is exactly revertable.
+/// changes, no untracked-not-ignored files) at session start, **ignoring any
+/// entries that lie under logbook's own `out_dir`**. A clean tree means git itself
+/// is the preimage, so the session's diff is exactly revertable.
+///
+/// logbook creates its store under `out_dir` (the default `.logbook` is inside the
+/// repo and untracked-not-ignored), which would otherwise make `git status` report
+/// the tree as dirty and wrongly flip every session to `revert_safe = false`. So
+/// the porcelain output is parsed and entries inside the resolved out-dir are
+/// discarded before deciding cleanliness; only changes *outside* the out-dir count.
+///
+/// `git status --porcelain` paths are relative to the **repo root** (not `cwd`), so
+/// exclusion joins each entry against the canonicalized repo root. When the out-dir
+/// is *outside* the repo there is nothing to exclude and every entry counts.
 ///
 /// Returns `false` (treat as dirty, the conservative default) when `cwd` is not a
 /// git repo or git is unavailable — a non-repo session is never revert_safe.
-fn git_tree_is_clean(cwd: &Path) -> bool {
+fn git_tree_is_clean(cwd: &Path, out_dir: &Path) -> bool {
     let out = match Command::new("git")
-        .args(["status", "--porcelain"])
+        // `-c core.quotePath=false` + `-z` mirrors `git_listed_files`: keep
+        // non-ASCII paths literal and NUL-delimit entries so a path containing a
+        // space or newline parses correctly (porcelain v1 still uses two leading
+        // status columns + a space before the path, even with `-z`).
+        .args(["-c", "core.quotePath=false", "status", "--porcelain", "-z"])
         .current_dir(cwd)
         .output()
     {
@@ -655,7 +770,59 @@ fn git_tree_is_clean(cwd: &Path) -> bool {
         // Not a repo / git missing / git error: conservatively treat as dirty.
         _ => return false,
     };
-    String::from_utf8_lossy(&out.stdout).trim().is_empty()
+
+    // Resolve the out-dir + repo root once for exclusion. If either is
+    // unavailable, fall back to "any entry ⇒ dirty" (the original behavior).
+    let out_dir_abs = resolved_out_dir_abs(cwd, out_dir);
+    let repo_root = git_repo_root(cwd);
+
+    let raw = String::from_utf8_lossy(&out.stdout);
+    // `is_clean` ⇔ NO surviving (non-out-dir) entry counts as dirty — negate `any`.
+    !parse_porcelain_paths(&raw).iter().any(|path| {
+        // An entry counts toward "dirty" unless it is inside logbook's out-dir.
+        match (out_dir_abs.as_deref(), repo_root.as_deref()) {
+            (Some(out_dir_abs), Some(root)) => !path_is_under(root, path, out_dir_abs),
+            // Could not resolve out-dir/root: no exclusion ⇒ the entry counts.
+            _ => true,
+        }
+    })
+}
+
+/// Parse the path field out of each `git status --porcelain -z` record. Each
+/// record is `XY<space><path>` (two status columns, a space, then the path);
+/// records are NUL-delimited (and there is no trailing record after the final
+/// NUL). Rename/copy entries (`X`/`Y` ∈ {`R`,`C`}) emit *two* NUL-joined chunks —
+/// `<new>\0<orig>` — where only the first carries the `XY ` status prefix and the
+/// second (origin) chunk is a bare path with no prefix.
+///
+/// We parse statefully so the origin chunk is taken **whole** (never heuristically
+/// de-prefixed): when a status chunk has a rename/copy code we expect the next
+/// chunk to be its origin path and yield it verbatim. This avoids mis-stripping an
+/// origin path whose first character is followed by a space. Yielding both the new
+/// and origin paths is intentional — for the cleanliness decision we only need to
+/// know whether *any* surviving entry is outside the out-dir.
+fn parse_porcelain_paths(raw: &str) -> Vec<&str> {
+    let mut paths = Vec::new();
+    let mut chunks = raw.split('\0').filter(|c| !c.is_empty());
+    while let Some(rec) = chunks.next() {
+        let bytes = rec.as_bytes();
+        // A well-formed status record is `XY path`: status codes in cols 0..2 and a
+        // space in col 2. Anything shorter is unexpected; take it whole defensively.
+        let (codes, path) = if bytes.len() > 3 && bytes[2] == b' ' {
+            (&rec[..2], &rec[3..])
+        } else {
+            ("", rec)
+        };
+        paths.push(path);
+        // Rename/copy in either index/worktree column ⇒ the next chunk is the
+        // origin path (no status prefix); consume + yield it verbatim.
+        if codes.contains('R') || codes.contains('C') {
+            if let Some(origin) = chunks.next() {
+                paths.push(origin);
+            }
+        }
+    }
+    paths
 }
 
 /// List files git knows about (tracked) plus untracked-but-not-ignored files,
@@ -803,6 +970,13 @@ mod tests {
         }
     }
 
+    /// An out-dir that resolves OUTSIDE any test repo, so baseline/clean-tree
+    /// exclusion is a no-op. Used by tests that drive `build_redacted_baseline`
+    /// directly and don't care about out-dir self-capture filtering.
+    fn no_out_dir() -> PathBuf {
+        std::env::temp_dir().join("logbook-test-out-dir-never-inside-repo")
+    }
+
     #[test]
     fn agent_name_extraction() {
         assert_eq!(agent_name_from("/usr/local/bin/claude"), "claude");
@@ -894,6 +1068,90 @@ mod tests {
         // The capture pipeline produced a transcript pointer under the same trace.
         let t = outcome.transcript.expect("transcript info");
         assert!(t.terminal_log_path.is_some());
+    }
+
+    /// Regression (HIGH, dogfood): with the out-dir INSIDE the working repo (the
+    /// default-style `.logbook` layout), logbook must NOT record its own store
+    /// files as agent changes, and a clean-tree session must stay revert_safe.
+    ///
+    /// Before the fix, creating the store under `.logbook/` made `git status`
+    /// report the tree dirty (untracked-not-ignored), so `git_tree_is_clean`
+    /// returned false (every action `revert_safe = false`) and `git ls-files
+    /// --others` listed `.logbook/*` into the baseline (extra `file_added`
+    /// self-captures). With the out-dir excluded from both the clean-tree check and
+    /// the baseline, only the agent's real edits are recorded and they stay
+    /// revert_safe on a clean tree.
+    #[test]
+    fn out_dir_inside_repo_is_excluded_from_diff_and_clean_tree() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cwd = tmp.path();
+        init_repo(cwd);
+        // A tracked file with a CLEAN initial commit (so the tree is clean at the
+        // moment the session starts — modulo logbook's own store, which is what we
+        // are asserting gets excluded).
+        std::fs::write(cwd.join("main.rs"), "fn main() {}\n").unwrap();
+        commit_all(cwd); // tree is CLEAN
+
+        // Out-dir is INSIDE the repo (the default `.logbook` layout). This is the
+        // configuration that triggered the dogfood bug.
+        let in_repo_out = cwd.join(".logbook");
+        let mut opts = opts_for(cwd, &in_repo_out);
+        opts.out_dir = in_repo_out.clone();
+
+        // The "agent" edits the tracked file AND adds a new untracked file.
+        let script =
+            "printf 'fn main() { /* edit */ }\\n' > main.rs; printf 'notes\\n' > NOTES.txt";
+        let argv = vec!["/bin/sh".to_string(), "-c".to_string(), script.to_string()];
+        let outcome = block_on(run_agent(&argv, &opts, &red())).unwrap();
+        assert_eq!(outcome.session.exit_code, Some(0));
+
+        // logbook really did create its store under `.logbook/` (so the exclusion
+        // is exercised, not vacuously true).
+        assert!(
+            in_repo_out.exists(),
+            "the wrapper must have created its store under .logbook/"
+        );
+
+        // (a) The recorded actions are EXACTLY the two real changes — and NOTHING
+        // under the out-dir (no `.logbook/*` self-captures).
+        let paths: Vec<&str> = outcome
+            .actions
+            .iter()
+            .map(|a| a.path.as_deref().unwrap_or(""))
+            .collect();
+        assert!(
+            paths.iter().all(|p| !p.contains(".logbook")),
+            "logbook recorded its own store as an agent change: {paths:?}"
+        );
+        assert_eq!(
+            outcome.actions.len(),
+            2,
+            "expected exactly the 2 real changes (main.rs edit + NOTES.txt add); got {:?}",
+            outcome.actions
+        );
+        let main = outcome
+            .actions
+            .iter()
+            .find(|a| a.path.as_deref().is_some_and(|p| p.ends_with("main.rs")))
+            .unwrap_or_else(|| panic!("no action for main.rs; got {:?}", outcome.actions));
+        let notes = outcome
+            .actions
+            .iter()
+            .find(|a| a.path.as_deref().is_some_and(|p| p.ends_with("NOTES.txt")))
+            .unwrap_or_else(|| panic!("no action for NOTES.txt; got {:?}", outcome.actions));
+        assert_eq!(main.kind, "file_modified");
+        assert_eq!(notes.kind, "file_added");
+
+        // (b) The tree was clean at start (its only "dirt" was logbook's own
+        // out-dir, now excluded), so the clean-tree edits are revert_safe.
+        assert!(
+            main.revert_safe,
+            "clean tree (out-dir excluded) ⇒ revert_safe for the tracked edit"
+        );
+        assert!(
+            notes.revert_safe,
+            "clean tree (out-dir excluded) ⇒ revert_safe for the added file"
+        );
     }
 
     #[test]
@@ -1254,7 +1512,9 @@ mod tests {
         commit_all(cwd); // tracked, so it appears in the baseline
 
         // Baseline before: over-cap snapshot (content not held, marker only).
-        let before = build_redacted_baseline(cwd, &red());
+        // out_dir points outside the repo here, so it excludes nothing.
+        let no_out = no_out_dir();
+        let before = build_redacted_baseline(cwd, &no_out, &red());
         let pre = before
             .files
             .get("big.bin")
@@ -1275,7 +1535,7 @@ mod tests {
             "edit must preserve byte length to exercise the regression"
         );
 
-        let after = build_redacted_baseline(cwd, &red());
+        let after = build_redacted_baseline(cwd, &no_out, &red());
         let post = after.files.get("big.bin").expect("file still present");
         assert!(post.content.is_none(), "still over-cap after the edit");
         assert_ne!(
@@ -1381,7 +1641,7 @@ mod tests {
         );
 
         // End-to-end: the baseline keyed by path contains both files' content.
-        let baseline = build_redacted_baseline(cwd, &red());
+        let baseline = build_redacted_baseline(cwd, &no_out_dir(), &red());
         assert!(
             baseline.files.contains_key(spaced),
             "baseline must key the spaced file: {:?}",
