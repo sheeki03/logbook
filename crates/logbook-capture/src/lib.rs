@@ -54,6 +54,6 @@ pub use paths::{
     find_matching_run, log_key, log_paths, resolve_tail_path, slugify, LogPaths, PathOptions,
     RunRecord,
 };
-pub use pty::{run, CaptureConfig};
+pub use pty::{run, run_with_outcome, CaptureConfig, CaptureOutcome, TranscriptInfo};
 pub use supervisor::{descendants, parse_pid_ppid, ProcSource, Supervisor};
 pub use tail::{TailOptions, run as tail_run};
