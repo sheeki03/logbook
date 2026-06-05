@@ -10,6 +10,7 @@ use std::path::Path;
 use logbook_core::{CapturePolicy, CliOverlay, LogbookConfig, MicrosTimestamp};
 use logbook_store::Store;
 
+pub mod codex;
 pub mod debug;
 pub mod detect;
 pub mod export;

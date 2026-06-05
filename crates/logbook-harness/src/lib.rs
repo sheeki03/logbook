@@ -2,9 +2,14 @@
 //! "Structured Agent Capture").
 //!
 //! This crate turns a coding **harness's** own records — Claude Code hook
-//! events and session-log transcript lines, Codex JSONL, Aider history — into
-//! the unified [`Event`](logbook_core::Event) spine the rest of logbook speaks.
-//! Each adapter implements the small [`HarnessAdapter`] trait:
+//! events and session-log transcript lines, Codex JSONL rollouts + the
+//! `codex exec --json` structured event stream, Aider history — into the
+//! unified [`Event`](logbook_core::Event) spine the rest of logbook speaks.
+//! Most adapters implement the small per-record [`HarnessAdapter`] trait; the
+//! Codex `--json` stream needs cross-line correlation state (thread id, turn),
+//! so [`CodexJsonAdapter`](codex_json::CodexJsonAdapter) exposes a whole-stream
+//! entry point ([`parse_codex_json_stream`](codex_json::parse_codex_json_stream))
+//! instead:
 //!
 //! ```text
 //! trait HarnessAdapter {
@@ -59,10 +64,12 @@ mod context;
 pub mod aider;
 pub mod claude;
 pub mod codex;
+pub mod codex_json;
 
 pub use aider::AiderAdapter;
 pub use claude::ClaudeCodeAdapter;
 pub use codex::CodexAdapter;
+pub use codex_json::{parse_codex_json_stream, CodexJsonAdapter};
 pub use context::HarnessContext;
 
 /// An adapter that normalizes one harness's native records into logbook
