@@ -17,15 +17,22 @@
 //! copy-pasteable Claude Code `settings.json` `hooks` recipe so a user can wire
 //! their harness to it, then blocks until Ctrl-C / SIGTERM.
 //!
-//! ## Why the recipe is a script (token mode), not an inline curl
+//! ## Why the recipe goes through a shell
 //! Claude Code execs a hook `command` **without** shell quote-processing, so an
 //! inline `curl … -H 'Authorization: Bearer <tok>' …` is mis-parsed (the quoted
 //! header arrives as a malformed argv token → the request is rejected → ZERO
 //! events captured, silently). So the token-mode banner hands the user a tiny
 //! hook **script** holding the curl and a `command` of `sh ~/.logbook-hook.sh`
-//! (no quotes for the runner to mangle). With `--no-token` there is no header to
-//! quote, so the `command` is a reliable quote-free one-liner and no script is
-//! needed.
+//! (no quotes for the runner to mangle).
+//!
+//! Both recipes also forward a `x-logbook-trace: $LOGBOOK_TRACE` header so the
+//! hooks **correlate** to the wrapped `logbook agent` session (which exports
+//! `LOGBOOK_TRACE` into the agent's environment). Because the runner does no
+//! shell processing, `$LOGBOOK_TRACE` only expands when the command runs through
+//! a shell: the token recipe expands it inside the `sh` script; the `--no-token`
+//! recipe — which has no Authorization header to quote — wraps its curl in
+//! `sh -c '…'` for the same reason. Outside a `logbook agent` run the variable is
+//! unset and the header is empty, which the receiver ignores.
 //!
 //! ## Redaction is sacred (plan §9)
 //! Every prompt / tool arg / tool result is redacted **before** persistence
@@ -212,7 +219,9 @@ fn print_token_recipe(base: &str, token: &str) {
     println!();
     println!("  #!/bin/sh");
     println!("  curl -sS -X POST {base}/v1/hooks \\");
+    println!("    -H \"Content-Type: application/json\" \\");
     println!("    -H \"Authorization: Bearer {token}\" \\");
+    println!("    -H \"x-logbook-trace: $LOGBOOK_TRACE\" \\");
     println!("    --data-binary @-");
     println!();
     println!("2) Add this `hooks` block to your settings.json (the `command` is quote-free):");
@@ -221,6 +230,14 @@ fn print_token_recipe(base: &str, token: &str) {
     println!();
     println!("Use it with `claude --settings <file>` or merge into ~/.claude/settings.json.");
     println!("(the hook's JSON payload is piped on stdin; the receiver redacts before storing.)");
+    println!();
+    println!("The `-H \"x-logbook-trace: $LOGBOOK_TRACE\"` line CORRELATES these hooks to the");
+    println!("wrapped `logbook agent` session: that wrapper exports LOGBOOK_TRACE into the agent's");
+    println!("environment, the hook script (run by /bin/sh) expands it at fire time, and the");
+    println!("receiver records the hook events under that SAME trace — so the agent transcript,");
+    println!("the LLM-proxy calls, and these tool/prompt events form one correlated session.");
+    println!("(Outside a `logbook agent` run LOGBOOK_TRACE is unset and the header is empty, which");
+    println!("the receiver ignores — each hook batch then gets its own trace, as before.)");
 }
 
 /// Print the wiring recipe when `--no-token` dropped the gate (local
@@ -232,16 +249,23 @@ fn print_no_token_recipe(base: &str) {
     println!("(token gate disabled via --no-token — LOCAL SINGLE-USER / dev only; every request is");
     println!("accepted. On a shared host, drop --no-token so the token blocks other local users.)");
     println!();
-    println!("With no Authorization header to quote, the hook command is a reliable one-liner");
-    println!("(Claude Code execs a hook `command` without shell quote-processing, so keeping it");
-    println!("header-free avoids the quoting that otherwise breaks delivery). Add this `hooks`");
-    println!("block to your settings.json:");
+    println!("There is no Authorization header to quote, but the command still forwards the");
+    println!("correlation header `x-logbook-trace: $LOGBOOK_TRACE`. Claude Code execs a hook");
+    println!("`command` WITHOUT shell quote-processing, so `$LOGBOOK_TRACE` would NOT expand in a");
+    println!("bare inline curl — the command is therefore wrapped in `sh -c '...'` so a shell");
+    println!("expands the variable at fire time. Add this `hooks` block to your settings.json:");
     println!();
-    print_settings_block(&format!(
-        "curl -sS -X POST {base}/v1/hooks --data-binary @-"
-    ));
+    print_settings_block(&no_token_hook_command(base));
     println!();
     println!("Use it with `claude --settings <file>` or merge into ~/.claude/settings.json.");
+    println!();
+    println!("The `-H \"x-logbook-trace: $LOGBOOK_TRACE\"` CORRELATES these hooks to the wrapped");
+    println!("`logbook agent` session: that wrapper exports LOGBOOK_TRACE into the agent's");
+    println!("environment, the `sh -c` shell expands it at fire time, and the receiver records the");
+    println!("hook events under that SAME trace — so the agent transcript, the LLM-proxy calls, and");
+    println!("these tool/prompt events form one correlated session. (Outside a `logbook agent` run");
+    println!("LOGBOOK_TRACE is unset and the header is empty, which the receiver ignores — each hook");
+    println!("batch then gets its own trace, as before.)");
 }
 
 /// Print a copy-pasteable Claude Code `settings.json` `hooks` block wiring all
@@ -252,24 +276,60 @@ fn print_no_token_recipe(base: &str) {
 /// groups, each group a `matcher` plus a `hooks` list of `{type:"command",
 /// command}` entries that receive the event JSON on stdin.
 fn print_settings_block(command: &str) {
-    println!("{{");
-    println!("  \"hooks\": {{");
+    print!("{}", settings_block(command));
+}
+
+/// Build the copy-pasteable Claude Code `settings.json` `hooks` block as a
+/// string (so it is testable as valid JSON), wiring the four capture-relevant
+/// lifecycle events to run `command` on stdin.
+///
+/// The `command` may contain double-quotes (the `--no-token` recipe wraps the
+/// curl in `sh -c '... -H "x-logbook-trace: $LOGBOOK_TRACE" ...'`), so it is
+/// JSON-escaped before being embedded as a string value — otherwise the printed
+/// settings.json is malformed and silently fails to parse.
+fn settings_block(command: &str) -> String {
+    use std::fmt::Write as _;
+    let command = json_escape(command);
+    let mut out = String::new();
+    let _ = writeln!(out, "{{");
+    let _ = writeln!(out, "  \"hooks\": {{");
     // The four events we care about. UserPromptSubmit + Stop bracket a turn;
     // Pre/PostToolUse capture each tool call.
     let events = ["UserPromptSubmit", "PreToolUse", "PostToolUse", "Stop"];
     for (i, event) in events.iter().enumerate() {
         let comma = if i + 1 < events.len() { "," } else { "" };
-        println!("    \"{event}\": [");
-        println!("      {{");
-        println!("        \"matcher\": \"*\",");
-        println!("        \"hooks\": [");
-        println!("          {{ \"type\": \"command\", \"command\": \"{command}\" }}");
-        println!("        ]");
-        println!("      }}");
-        println!("    ]{comma}");
+        let _ = writeln!(out, "    \"{event}\": [");
+        let _ = writeln!(out, "      {{");
+        let _ = writeln!(out, "        \"matcher\": \"*\",");
+        let _ = writeln!(out, "        \"hooks\": [");
+        let _ = writeln!(out, "          {{ \"type\": \"command\", \"command\": \"{command}\" }}");
+        let _ = writeln!(out, "        ]");
+        let _ = writeln!(out, "      }}");
+        let _ = writeln!(out, "    ]{comma}");
     }
-    println!("  }}");
-    println!("}}");
+    let _ = writeln!(out, "  }}");
+    let _ = writeln!(out, "}}");
+    out
+}
+
+/// The hook `command` the `--no-token` recipe prints: a `sh -c` wrapper so the
+/// shell expands `$LOGBOOK_TRACE` at fire time (Claude Code execs the hook
+/// `command` without shell quote-processing, so a bare inline curl would not
+/// expand it). Factored out so the forwarded correlation header is unit-tested.
+fn no_token_hook_command(base: &str) -> String {
+    format!(
+        "sh -c 'curl -sS -X POST {base}/v1/hooks -H \"Content-Type: application/json\" -H \"x-logbook-trace: $LOGBOOK_TRACE\" --data-binary @-'"
+    )
+}
+
+/// Minimal JSON string-body escaper for the hook `command` embedded in the
+/// printed settings.json. Escapes the two characters that would otherwise break
+/// the surrounding `"..."` string: backslash and double-quote. (The commands we
+/// print never contain control characters, so this is sufficient and keeps the
+/// snippet human-readable — a full `serde_json::to_string` would also work but
+/// would escape nothing else here anyway.)
+fn json_escape(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
 #[cfg(test)]
@@ -344,5 +404,63 @@ mod tests {
             "no flag and no env var ⇒ mint a fresh token"
         );
         assert_eq!(resolve_token_mode(false, true), TokenMode::Env);
+    }
+
+    /// `json_escape` escapes exactly the two characters that would break the
+    /// surrounding `"..."` JSON string value (backslash, double-quote).
+    #[test]
+    fn json_escape_handles_quotes_and_backslashes() {
+        assert_eq!(json_escape("plain"), "plain");
+        assert_eq!(json_escape(r#"a "b" c"#), r#"a \"b\" c"#);
+        assert_eq!(json_escape(r"a\b"), r"a\\b");
+    }
+
+    /// The `--no-token` recipe's hook command forwards the correlation header so
+    /// the wrapped `logbook agent` session's `LOGBOOK_TRACE` is propagated, and it
+    /// goes through a shell (`sh -c '...'`) so the variable expands at fire time
+    /// (Claude Code execs the `command` without shell quote-processing).
+    #[test]
+    fn no_token_command_forwards_correlation_header_via_shell() {
+        let cmd = no_token_hook_command("http://127.0.0.1:4318");
+        assert!(cmd.starts_with("sh -c '"), "must run through a shell: {cmd}");
+        assert!(
+            cmd.contains("-H \"x-logbook-trace: $LOGBOOK_TRACE\""),
+            "must forward the correlation header: {cmd}"
+        );
+        assert!(cmd.contains("http://127.0.0.1:4318/v1/hooks"), "posts to the receiver: {cmd}");
+        assert!(cmd.contains("--data-binary @-"), "still pipes the payload on stdin: {cmd}");
+    }
+
+    /// Both recipe `command` shapes embed as VALID JSON in the printed settings
+    /// block (a malformed block would silently fail to parse in Claude Code), and
+    /// the `command` round-trips byte-for-byte through the JSON escaping.
+    #[test]
+    fn settings_block_is_valid_json_for_both_recipes() {
+        // --no-token: the `sh -c '...'` form contains inner double-quotes.
+        let no_tok_cmd = no_token_hook_command("http://127.0.0.1:4318");
+        let block = settings_block(&no_tok_cmd);
+        let parsed: serde_json::Value =
+            serde_json::from_str(&block).expect("no-token settings block must be valid JSON");
+        let got = parsed["hooks"]["PostToolUse"][0]["hooks"][0]["command"]
+            .as_str()
+            .expect("command string");
+        assert_eq!(got, no_tok_cmd, "command must round-trip through the JSON escaping");
+        assert!(
+            got.contains("x-logbook-trace: $LOGBOOK_TRACE"),
+            "forwarded correlation header survives into the JSON: {got}"
+        );
+        // All four lifecycle events are wired.
+        for ev in ["UserPromptSubmit", "PreToolUse", "PostToolUse", "Stop"] {
+            assert!(parsed["hooks"].get(ev).is_some(), "missing event {ev}");
+        }
+
+        // token mode: the `command` is the quote-free `sh ~/.logbook-hook.sh`.
+        let tok_block = settings_block("sh ~/.logbook-hook.sh");
+        let tok_parsed: serde_json::Value =
+            serde_json::from_str(&tok_block).expect("token settings block must be valid JSON");
+        assert_eq!(
+            tok_parsed["hooks"]["Stop"][0]["hooks"][0]["command"].as_str(),
+            Some("sh ~/.logbook-hook.sh")
+        );
     }
 }

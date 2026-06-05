@@ -29,6 +29,7 @@
 
 pub mod capture_policy;
 pub mod config;
+pub mod correlation;
 pub mod error;
 pub mod event;
 pub mod ids;
@@ -44,6 +45,7 @@ pub use capture_policy::{
     RedactionMode, SensitivityClass, Tiers, CAPTURE_STATE_FILENAME,
 };
 pub use config::{LogbookConfig, CONFIG_FILENAME, INVENTORY_WATCH_WRITE};
+pub use correlation::{parse_trace, trace_from_env, SESSION_ENV, TRACE_ENV, TRACE_HEADER};
 pub use error::{CoreError, Result};
 pub use event::{
     AgentBlock, Blocks, Category, ConsoleBlock, Event, FindingBlock, Kind, LlmBlock,

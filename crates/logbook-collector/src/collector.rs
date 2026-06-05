@@ -27,7 +27,7 @@ use tower_http::cors::{AllowOrigin, CorsLayer};
 use logbook_core::text::truncate_with_ellipsis;
 use logbook_core::{
     CapturePolicy, Category, ConsoleBlock, Event, Kind, MicrosTimestamp, Redactor, SensitivityClass,
-    SessionId, Status, TraceId,
+    SessionId, Status, TraceId, TRACE_HEADER,
 };
 use logbook_harness::{ClaudeCodeAdapter, HarnessAdapter, HarnessContext};
 use logbook_store::Store;
@@ -519,13 +519,17 @@ async fn ingest(
 async fn ingest_hooks(
     State(state): State<AppState>,
     headers: HeaderMap,
-    body: Result<Json<Value>, axum::extract::rejection::JsonRejection>,
+    // Read the raw body (not the `Json` extractor): a hand-wired hook `curl` often
+    // omits `Content-Type: application/json`, and the strict `Json` extractor then
+    // rejects it — which silently dropped real hook events. Parse the bytes as JSON
+    // ourselves so the receiver accepts the payload regardless of content-type.
+    body: axum::body::Bytes,
 ) -> Response {
     if !authorize(&state.token, &headers) {
         return (StatusCode::UNAUTHORIZED, "unauthorized").into_response();
     }
-    let payload = match body {
-        Ok(Json(v)) => v,
+    let payload: Value = match serde_json::from_slice(&body) {
+        Ok(v) => v,
         Err(_) => return (StatusCode::BAD_REQUEST, "invalid JSON").into_response(),
     };
 
@@ -541,12 +545,30 @@ async fn ingest_hooks(
         return StatusCode::NO_CONTENT.into_response();
     }
 
-    // Optional trace/session correlation from the body (a fresh trace otherwise).
-    let trace = payload
-        .get("trace")
-        .or_else(|| payload.get("trace_id"))
-        .and_then(Value::as_str)
-        .and_then(parse_trace_hex)
+    // Trace correlation (cross-tier, plan: "single correlated session"). Order of
+    // precedence:
+    //   1. the `x-logbook-trace` request header — the standard propagation the
+    //      wrapped `logbook agent` session forwards (it exports `LOGBOOK_TRACE`,
+    //      and the printed hook recipe forwards it as this header). This is the
+    //      signal that stitches the hooks lane onto the SAME trace as the proxy +
+    //      agent-wrap lanes, so it wins over any per-payload trace;
+    //   2. a body `trace`/`trace_id` field (the legacy in-band correlation);
+    //   3. a freshly minted trace (each lane stays its own correlated unit).
+    // The header is validated with `logbook_core`'s shared rule (32-hex,
+    // non-zero); a malformed/absent header falls through to the body/minted trace,
+    // i.e. the prior behaviour is preserved exactly.
+    let header_trace_id = header_trace(&headers);
+    // `TraceId::new()` mints a fresh RANDOM id, not the all-zero `Default`, so
+    // clippy's `unwrap_or_default` suggestion would be semantically wrong here.
+    #[allow(clippy::unwrap_or_default)]
+    let trace = header_trace_id
+        .or_else(|| {
+            payload
+                .get("trace")
+                .or_else(|| payload.get("trace_id"))
+                .and_then(Value::as_str)
+                .and_then(parse_trace_hex)
+        })
         .unwrap_or_else(TraceId::new);
     let session = payload
         .get("session")
@@ -560,13 +582,23 @@ async fn ingest_hooks(
     }
 
     // Build a per-request harness context (redactor + policy) mirroring the
-    // server's resolved posture; the adapter routes every payload through it.
+    // server's resolved posture; the adapter routes every payload through it. The
+    // adapter is seeded with the resolved `trace` so the events it mints — and the
+    // span ids it derives from the trace — are all consistent under one trace.
     let ctx = state.harness_context();
     let adapter = ClaudeCodeAdapter::new(trace, ctx, harness_version_of(&payload));
 
     let mut events: Vec<Event> = Vec::new();
     for rec in &records {
         for mut ev in adapter.parse_record(rec) {
+            // Re-stamp the trace from the header when one was forwarded: this makes
+            // the header authoritative for *every* parsed event's `trace_id`, even
+            // if a future adapter path were to mint its own trace internally. (When
+            // there is no header, the adapter already minted on `trace`, so this is
+            // a no-op.)
+            if let Some(h) = header_trace_id {
+                ev.trace_id = h;
+            }
             if let Some(s) = &session {
                 ev = ev.with_session(s.clone());
             }
@@ -824,6 +856,19 @@ fn parse_trace_hex(hex: &str) -> Option<TraceId> {
         return None;
     }
     Some(TraceId::from_bytes(bytes))
+}
+
+/// Extract a correlation [`TraceId`] from the `x-logbook-trace` request header
+/// ([`logbook_core::TRACE_HEADER`]), if present and valid.
+///
+/// Validation uses `logbook_core`'s shared rule (32 hex chars, non-zero) so the
+/// hook receiver, the LLM proxy, and the env-var hand-off all agree on what a
+/// well-formed trace is. A missing header, a non-ASCII header value, or a
+/// malformed/all-zero hex string yields `None` — the caller then falls back to
+/// the body trace or mints a fresh one, exactly as before this header existed.
+fn header_trace(headers: &HeaderMap) -> Option<TraceId> {
+    let raw = headers.get(TRACE_HEADER)?.to_str().ok()?;
+    logbook_core::parse_trace(raw)
 }
 
 /// Pull the hook record(s) out of a `/v1/hooks` body: a single record object,
@@ -1232,6 +1277,37 @@ mod tests {
         assert!(constant_time_eq(b"abc", b"abc"));
         assert!(!constant_time_eq(b"abc", b"abd"));
         assert!(!constant_time_eq(b"abc", b"abcd"));
+    }
+
+    #[test]
+    fn header_trace_reads_and_validates_x_logbook_trace() {
+        fn with_header(value: &'static str) -> HeaderMap {
+            let mut headers = HeaderMap::new();
+            headers.insert(TRACE_HEADER, HeaderValue::from_static(value));
+            headers
+        }
+
+        // Present + valid: returned as a TraceId.
+        let hex = "11111111222222223333333344444444";
+        assert_eq!(
+            header_trace(&with_header(hex)).map(|t| t.to_hex()),
+            Some(hex.to_string())
+        );
+
+        // Absent: None (caller falls back to the body trace / mints one).
+        assert!(header_trace(&HeaderMap::new()).is_none(), "absent header ⇒ None");
+
+        // Malformed (not 32-hex): None.
+        assert!(
+            header_trace(&with_header("not-a-valid-trace")).is_none(),
+            "malformed header ⇒ None"
+        );
+
+        // All-zero (invalid per W3C): None.
+        assert!(
+            header_trace(&with_header("00000000000000000000000000000000")).is_none(),
+            "all-zero header ⇒ None"
+        );
     }
 
     #[test]

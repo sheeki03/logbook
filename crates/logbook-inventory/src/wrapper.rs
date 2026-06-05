@@ -34,6 +34,7 @@ use std::collections::BTreeMap;
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 
+use logbook_core::correlation::{SESSION_ENV, TRACE_ENV};
 use logbook_core::{CapturePolicy, Redactor, SensitivityClass, SessionId, TraceId};
 
 use crate::error::{InventoryError, Result};
@@ -178,7 +179,12 @@ pub async fn run_agent(
 ) -> Result<LogbookOutcome> {
     assert!(!argv.is_empty(), "run_agent requires a non-empty argv");
     let agent = agent_name_from(&argv[0]);
-    let trace = TraceId::new();
+    // Adopt an inbound `LOGBOOK_TRACE` when an orchestrator has already established
+    // the session trace (so the proxy + hooks + this wrapper all correlate); else
+    // mint a fresh one. Either way it is re-exported to the child via `extra_env`.
+    // (`TraceId::new()` mints a fresh RANDOM id, not the all-zero `Default`.)
+    #[allow(clippy::unwrap_or_default)]
+    let trace = logbook_core::correlation::trace_from_env().unwrap_or_else(TraceId::new);
     let session_id = SessionId::generate();
     let command_line = redactor.redact(&argv.join(" ")).into_owned();
     let started_at = now_micros();
@@ -217,6 +223,19 @@ pub async fn run_agent(
         // `redact = false` makes the capture pipeline drop to the secrets floor
         // only (mirroring `--no-redact`); the general redactor stays on otherwise.
         cfg.redact = opts.redaction_enabled;
+
+        // Cross-tier correlation (plan: "single correlated session"): export the
+        // minted trace/session into the WRAPPED CHILD's environment so the agent —
+        // and anything it spawns, e.g. a harness firing `logbook hooks` — can read
+        // `LOGBOOK_TRACE` back and forward it as the `x-logbook-trace` header.
+        // Without this, the proxy lane, the hooks lane, and this wrapper lane each
+        // mint a *different* trace and the session is scattered across several.
+        //
+        // Set child-scoped via `CaptureConfig::extra_env` → `CommandBuilder::env`
+        // (no process-global env mutation, no lock): the child reads `LOGBOOK_TRACE`
+        // and forwards it as the `x-logbook-trace` header so its hooks and proxied
+        // LLM calls land under this same session trace.
+        cfg.extra_env = correlation_env(trace, &session_id);
         let outcome = logbook_capture::run_with_outcome(cfg)
             .await
             .map_err(|source| InventoryError::Capture {
@@ -908,6 +927,18 @@ fn now_micros() -> i64 {
     logbook_core::MicrosTimestamp::now().as_micros()
 }
 
+/// The correlation environment pairs the wrapper exports into the wrapped child:
+/// `LOGBOOK_TRACE=<trace hex>` and `LOGBOOK_SESSION=<session id>`. Factored out
+/// so the contract (names + value encodings) is unit-testable without spawning a
+/// child. Returns owned `(key, value)` pairs (the keys are the
+/// [`logbook_core::correlation`] constants).
+fn correlation_env(trace: TraceId, session: &SessionId) -> Vec<(String, String)> {
+    vec![
+        (TRACE_ENV.to_string(), trace.to_hex()),
+        (SESSION_ENV.to_string(), session.clone().into_inner()),
+    ]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1068,6 +1099,74 @@ mod tests {
         // The capture pipeline produced a transcript pointer under the same trace.
         let t = outcome.transcript.expect("transcript info");
         assert!(t.terminal_log_path.is_some());
+    }
+
+    /// `correlation_env` (pure): the wrapper hands the child exactly the two
+    /// contract vars — `LOGBOOK_TRACE` as 32-hex and `LOGBOOK_SESSION` as the
+    /// session-id string — keyed by the `logbook_core::correlation` constants.
+    #[test]
+    fn correlation_env_carries_trace_and_session() {
+        let trace = TraceId::new();
+        let session = SessionId::new("session-abc-123");
+        let env = correlation_env(trace, &session);
+        let map: BTreeMap<&str, &str> = env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+
+        let trace_val = *map.get(TRACE_ENV).expect("LOGBOOK_TRACE present");
+        assert_eq!(trace_val, trace.to_hex().as_str());
+        // The trace value must be the 32-hex render the `x-logbook-trace` header
+        // (and the proxy/collector parsers) expect.
+        assert_eq!(trace_val.len(), 32);
+        assert_eq!(map.get(SESSION_ENV).copied(), Some("session-abc-123"));
+    }
+
+    /// Cross-tier correlation: the wrapped child's environment carries
+    /// `LOGBOOK_TRACE`/`LOGBOOK_SESSION` equal to the trace/session the wrapper
+    /// minted for the session. We wrap a `/bin/sh -c` "agent" that echoes the two
+    /// vars into a file (mirroring `run_agent_records_session_and_diff_in_real_repo`'s
+    /// child), then read the file back and assert it matches the recorded session
+    /// — proving the env actually reaches the child the PTY spawns, not just the
+    /// `correlation_env` vector.
+    #[test]
+    fn wrapped_child_inherits_correlation_env() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cwd = tmp.path();
+        let out = tempfile::tempdir().unwrap();
+        init_repo(cwd);
+
+        let opts = opts_for(cwd, out.path());
+        // The "agent" writes the two correlation vars (one per line) into a file
+        // in the repo. `$LOGBOOK_TRACE`/`$LOGBOOK_SESSION` expand in the child's
+        // own shell, so the file's contents are whatever the child inherited.
+        let argv = vec![
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            "printf '%s\\n%s\\n' \"$LOGBOOK_TRACE\" \"$LOGBOOK_SESSION\" > corr_env.txt"
+                .to_string(),
+        ];
+        let outcome = block_on(run_agent(&argv, &opts, &red())).unwrap();
+        assert_eq!(outcome.session.exit_code, Some(0));
+
+        let written = std::fs::read_to_string(cwd.join("corr_env.txt"))
+            .expect("agent should have written corr_env.txt");
+        let mut lines = written.lines();
+        let child_trace = lines.next().unwrap_or_default();
+        let child_session = lines.next().unwrap_or_default();
+
+        assert_eq!(
+            child_trace,
+            outcome.session.trace_id.as_str(),
+            "child's LOGBOOK_TRACE must equal the session's recorded trace"
+        );
+        assert_eq!(child_trace.len(), 32, "LOGBOOK_TRACE must be 32-hex");
+        assert!(
+            !child_session.is_empty(),
+            "child's LOGBOOK_SESSION must be set, got empty"
+        );
+        assert_eq!(
+            child_session,
+            outcome.session.session_id.as_str(),
+            "child's LOGBOOK_SESSION must equal the session id"
+        );
     }
 
     /// Regression (HIGH, dogfood): with the out-dir INSIDE the working repo (the

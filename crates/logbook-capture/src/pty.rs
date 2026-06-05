@@ -78,6 +78,12 @@ pub struct CaptureConfig {
     /// passes its `LogbookOptions.cwd` so the child — and the diff baseline it
     /// drives — are rooted in the caller's chosen directory.
     pub cwd: Option<PathBuf>,
+    /// Extra environment variables to set on the spawned child, applied
+    /// child-scoped via `CommandBuilder::env` (on top of the inherited env). The
+    /// agent wrapper uses this to export the correlation vars
+    /// (`LOGBOOK_TRACE`/`LOGBOOK_SESSION`) so the child — and any hooks it fires —
+    /// inherit the session's trace, with no process-global env mutation.
+    pub extra_env: Vec<(String, String)>,
 }
 
 impl CaptureConfig {
@@ -96,6 +102,7 @@ impl CaptureConfig {
             trace_id: None,
             session_id: None,
             cwd: None,
+            extra_env: Vec::new(),
         }
     }
 
@@ -442,6 +449,12 @@ pub async fn run_with_outcome(config: CaptureConfig) -> Result<CaptureOutcome> {
     // what roots an agent session's file diffs in the wrapper's chosen directory.
     if let Some(cwd) = run_cwd.as_ref() {
         cmd.cwd(cwd);
+    }
+    // Child-scoped extra env (e.g. the correlation vars LOGBOOK_TRACE/SESSION the
+    // agent wrapper sets) — applied on top of the inherited environment, with no
+    // process-global mutation.
+    for (key, value) in &config.extra_env {
+        cmd.env(key, value);
     }
 
     let mut child = pair

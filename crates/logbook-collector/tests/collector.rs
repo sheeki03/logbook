@@ -456,6 +456,133 @@ async fn hooks_401_without_token_and_normalizes_a_sample_hook() {
 }
 
 #[tokio::test]
+async fn hooks_use_x_logbook_trace_header_as_event_trace() {
+    // Cross-tier correlation: when the `x-logbook-trace` request header carries a
+    // valid 32-hex trace, EVERY event parsed from the hook payload is persisted
+    // under THAT trace — overriding the per-payload `trace` field. This is what
+    // stitches the hooks lane onto the same trace as the wrapped `logbook agent`
+    // session (which exports `LOGBOOK_TRACE`, forwarded by the printed recipe as
+    // this header) and the proxy lane.
+    let (running, store, _dir) = start_test_collector().await;
+    let url = format!("http://127.0.0.1:{}/v1/hooks", running.port());
+    let token = running.token().unwrap().to_string();
+
+    // The header trace and the body trace are DIFFERENT, so the assertion proves
+    // the header is authoritative (not merely "a trace was used").
+    let header_trace = "11111111222222223333333344444444";
+    let body_trace = "aaaaaaaabbbbbbbbccccccccdddddddd";
+    let hook = serde_json::json!({
+        "trace": body_trace,
+        "session": "sess-corr",
+        "hook_event_name": "PostToolUse",
+        "tool_name": "Bash",
+        "tool_use_id": "toolu_corr",
+        "tool_input": { "command": "echo hi" },
+        "tool_response": { "stdout": "hi\n", "stderr": "" }
+    });
+
+    let resp = reqwest::Client::new()
+        .post(&url)
+        .bearer_auth(&token)
+        .header(logbook_core::TRACE_HEADER, header_trace)
+        .json(&hook)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 204, "valid hook accepted");
+
+    // The event landed under the HEADER trace.
+    let by_header = store.query(&Query::new().trace(header_trace).limit(10)).unwrap();
+    assert_eq!(
+        by_header.len(),
+        1,
+        "the persisted event must be under the x-logbook-trace header's trace"
+    );
+    assert_eq!(by_header[0].trace_id.to_hex(), header_trace);
+    assert_eq!(by_header[0].kind, logbook_core::Kind::Tool);
+    // ...and NOT under the body trace it would have used without the header.
+    let by_body = store.query(&Query::new().trace(body_trace).limit(10)).unwrap();
+    assert!(
+        by_body.is_empty(),
+        "header must override the body `trace`; found events under the body trace"
+    );
+    // Session correlation is unaffected by the trace override.
+    assert_eq!(
+        by_header[0].session_id.as_ref().map(logbook_core::SessionId::as_str),
+        Some("sess-corr")
+    );
+
+    running.shutdown().await;
+}
+
+#[tokio::test]
+async fn hooks_ignore_malformed_or_absent_trace_header() {
+    // Negative half of the contract: a malformed `x-logbook-trace` header (and an
+    // absent one) leave the prior behaviour intact — the body `trace` is used.
+    // The header must never produce a bogus/zero trace or clobber a valid body
+    // trace with garbage.
+    let (running, store, _dir) = start_test_collector().await;
+    let url = format!("http://127.0.0.1:{}/v1/hooks", running.port());
+    let token = running.token().unwrap().to_string();
+    let client = reqwest::Client::new();
+
+    let body_trace = "aaaaaaaabbbbbbbbccccccccdddddddd";
+    let mk_hook = |tool_use_id: &str| {
+        serde_json::json!({
+            "trace": body_trace,
+            "hook_event_name": "PostToolUse",
+            "tool_name": "Bash",
+            "tool_use_id": tool_use_id,
+            "tool_input": { "command": "echo hi" },
+            "tool_response": { "stdout": "hi\n", "stderr": "" }
+        })
+    };
+
+    // Malformed header (not 32-hex) → ignored, body trace used.
+    let resp = client
+        .post(&url)
+        .bearer_auth(&token)
+        .header(logbook_core::TRACE_HEADER, "not-a-valid-trace")
+        .json(&mk_hook("toolu_bad"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 204);
+
+    // All-zero header → invalid per W3C → ignored, body trace used.
+    let resp = client
+        .post(&url)
+        .bearer_auth(&token)
+        .header(logbook_core::TRACE_HEADER, "0".repeat(32))
+        .json(&mk_hook("toolu_zero"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 204);
+
+    // No header at all → body trace used (the pre-existing behaviour).
+    let resp = client
+        .post(&url)
+        .bearer_auth(&token)
+        .json(&mk_hook("toolu_none"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 204);
+
+    // All three landed under the BODY trace; none minted a fresh/zero trace.
+    let by_body = store.query(&Query::new().trace(body_trace).limit(10)).unwrap();
+    assert_eq!(
+        by_body.len(),
+        3,
+        "malformed/all-zero/absent header ⇒ body trace is used (prior behaviour)"
+    );
+    assert_eq!(store.count().unwrap(), 3, "no extra events under any other trace");
+
+    running.shutdown().await;
+}
+
+#[tokio::test]
 async fn hooks_skip_unknown_records_with_no_persist() {
     // An unrecognized hook record normalizes to zero events → 204, nothing stored
     // (the adapter is tolerant).
