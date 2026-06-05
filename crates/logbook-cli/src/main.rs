@@ -11,6 +11,9 @@
 //! | `proxy` / `hooks`   | `logbook-collector` |
 //! | `ui`                | `logbook-ui`        |
 //! | `agent`,`inventory` | `logbook-inventory` |
+//! | `revert`,`session`,`forget` | `logbook-inventory` (governance) |
+//! | `detect`            | `logbook-detect`     |
+//! | `guard`             | `logbook-inventory` + `logbook-detect` |
 //! | `debug`             | `logbook-debug`     |
 //! | `security`          | `logbook-security`  |
 //! | `export`            | `logbook-export`    |
@@ -39,8 +42,10 @@ use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
 use logbook_inventory::cli::{AgentArgs, InventoryArgs};
 
-use commands::{debug as debug_cmd, export as export_cmd, hooks as hooks_cmd, mcp as mcp_cmd,
-    proxy as proxy_cmd, run as run_cmd, security as security_cmd, ui as ui_cmd};
+use commands::{debug as debug_cmd, detect as detect_cmd, export as export_cmd,
+    forget as forget_cmd, guard as guard_cmd, hooks as hooks_cmd, mcp as mcp_cmd,
+    proxy as proxy_cmd, revert as revert_cmd, run as run_cmd, security as security_cmd,
+    session as session_cmd, ui as ui_cmd};
 
 /// Local-first observability plane for agent-built software.
 #[derive(Debug, Parser)]
@@ -98,6 +103,30 @@ enum Command {
     /// Langfuse / MLflow). v1 = schema only, no network export.
     Export(export_cmd::ExportArgs),
 
+    /// Reverse a recorded session's file changes (Phase 3). Only `revert_safe`
+    /// (clean-tree) actions are restored, from git HEAD, and only when the file
+    /// still matches its recorded post-state hash; dirty-tree actions are
+    /// refused.
+    Revert(revert_cmd::RevertArgs),
+
+    /// Session governance (Phase 3): `session export <id>` writes a per-class
+    /// sanitized bundle (metadata-only by default; payload classes dropped).
+    Session(session_cmd::SessionArgs),
+
+    /// Forget a recorded session (or everything `--before` a duration) from the
+    /// store + disk (Phase 3). Irreversible — requires `--yes`.
+    Forget(forget_cmd::ForgetArgs),
+
+    /// Run the Phase-3 risk rules over a recorded session (or recent events),
+    /// printing + persisting findings (`Kind::Finding` / `Category::Security`).
+    Detect(detect_cmd::DetectArgs),
+
+    /// Run an agent under capture (like `agent`), then evaluate the risk rules
+    /// over the session and exit non-zero if a finding is at/above `--halt-on`
+    /// (Phase 3). Run-then-detect: real-time pre-execution blocking is a
+    /// follow-up.
+    Guard(guard_cmd::GuardArgs),
+
     /// logbook hub (v1.5) — receiver / retention / audit / RBAC.
     Hub(HubArgs),
 }
@@ -143,6 +172,11 @@ fn dispatch(command: Command) -> anyhow::Result<i32> {
         Command::Debug(args) => debug_cmd::run(args),
         Command::Security(args) => security_cmd::run(args),
         Command::Export(args) => export_cmd::run(args),
+        Command::Revert(args) => revert_cmd::run(args),
+        Command::Session(args) => session_cmd::run(args),
+        Command::Forget(args) => forget_cmd::run(args),
+        Command::Detect(args) => detect_cmd::run(args),
+        Command::Guard(args) => guard_cmd::run(args),
         Command::Hub(_) => {
             // Explicit v1 cut line (plan §12): announce + succeed.
             println!("logbook hub: v1.5 — not yet implemented");

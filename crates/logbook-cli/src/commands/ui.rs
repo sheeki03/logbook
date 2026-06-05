@@ -55,17 +55,24 @@ pub fn run(args: UiArgs) -> anyhow::Result<i32> {
         parent_pid: None,
     };
 
-    // Wire the Capture panel's write surface (plan §1.4): the runtime override
-    // lands in `<out_dir>/capture-state.json` (narrow-only, cross-process), and
-    // the durable `logbook.toml [capture]` write is gated behind
-    // `--allow-config-write`. The capture root (where `logbook.toml` lives)
-    // defaults to the current directory — the same root capturing producers
-    // (`logbook run`/`agent`) resolve via `std::env::current_dir()` — so the UI
-    // and producers agree on which `logbook.toml` to read/write.
+    // The capture root (where `logbook.toml` lives) defaults to the current
+    // directory — the same root capturing producers (`logbook run`/`agent`)
+    // resolve via `std::env::current_dir()` — so the UI and producers agree on
+    // which `logbook.toml` to read/write.
     let capture_root = args
         .root
         .clone()
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+
+    // Enforce retention on startup (plan §3 / Phase 3: "run at `ui`/`agent`
+    // startup"). Best-effort: a prune failure must never stop the UI from
+    // serving, so it is logged and we continue.
+    super::prune_retention(&store, &capture_root, &args.out_dir);
+
+    // Wire the Capture panel's write surface (plan §1.4): the runtime override
+    // lands in `<out_dir>/capture-state.json` (narrow-only, cross-process), and
+    // the durable `logbook.toml [capture]` write is gated behind
+    // `--allow-config-write`.
     let state = AppState::new(store, bus).with_capture(
         args.out_dir.clone(),
         capture_root,

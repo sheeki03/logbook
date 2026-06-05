@@ -5,7 +5,7 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
-description = "logbook CLI: run | tail | mcp | proxy | hooks | ui | agent | debug | inventory | security | export | hub."
+description = "logbook CLI: run | tail | mcp | proxy | hooks | ui | agent | inventory | revert | session | forget | detect | guard | debug | security | export | hub."
 
 [[bin]]
 name = "logbook"
@@ -16,6 +16,10 @@ logbook-capture = { version = "0.1.0", path = "../logbook-capture" }
 logbook-collector = { version = "0.1.0", path = "../logbook-collector" }
 logbook-core = { version = "0.1.0", path = "../logbook-core" }
 logbook-debug = { version = "0.1.0", path = "../logbook-debug" }
+# logbook-detect powers `logbook detect` + the run-then-detect `logbook guard`
+# (the Phase-3 risk rules evaluated over a recorded session's redacted events).
+# Referenced by path, matching the other workspace members above.
+logbook-detect = { version = "0.1.0", path = "../logbook-detect" }
 logbook-export = { version = "0.1.0", path = "../logbook-export" }
 # logbook-harness powers `logbook proxy mcp` (the HarnessContext the recording
 # MCP transport routes redacted tool payloads through). Referenced by path,
