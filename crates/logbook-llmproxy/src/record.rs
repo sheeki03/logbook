@@ -79,8 +79,15 @@ pub fn record_llm_event(ctx: &HarnessContext, inputs: RecordInputs<'_>) -> Event
         duration_ms,
     } = inputs;
 
+    // The recorded `stream` flag reflects whether streaming was *in play* — either
+    // the client asked for it or the upstream replied with an event stream.
     let streamed = response.is_event_stream() || request.wants_stream();
-    let meta = extract_completion_meta(response, streamed);
+    // The parser choice, however, is driven by the RESPONSE shape only: a client
+    // can ask for `stream:true` and still receive a buffered JSON body (the
+    // provider ignored the flag, or it's a 4xx/5xx JSON error body). Keying the
+    // reassembly off `request.wants_stream()` would run `reassemble_sse` on that
+    // JSON, find no `data:` lines, and silently drop tokens/finish-reason/cost.
+    let meta = extract_completion_meta(response);
 
     // Model: prefer the response's reported model, fall back to the request's.
     let model = meta
@@ -280,10 +287,18 @@ fn derive_cost(price: Option<ModelPrice>, input: Option<u64>, output: Option<u64
     Some((i * price.input_per_mtok + o * price.output_per_mtok) / 1_000_000.0)
 }
 
-/// Extract provider-agnostic completion metadata from a response, reassembling
-/// an SSE stream when `streamed` is set.
-fn extract_completion_meta(response: &UpstreamResponse, streamed: bool) -> CompletionMeta {
-    if streamed {
+/// Extract provider-agnostic completion metadata from a response.
+///
+/// The parser is chosen from the **response shape**, never the request: SSE is
+/// reassembled only when the upstream actually replied with an event stream
+/// (`response.is_event_stream()`); otherwise the buffered JSON body is parsed.
+/// This matters because a client can send `stream:true` yet receive a buffered
+/// JSON body — the provider ignored the flag, or it's a 4xx/5xx JSON error body.
+/// Reassembling SSE over that JSON would find no `data:` lines and return a
+/// default (empty) meta, silently dropping the tokens/finish-reason/cost that
+/// are sitting right there in the body.
+fn extract_completion_meta(response: &UpstreamResponse) -> CompletionMeta {
+    if response.is_event_stream() {
         reassemble_sse(&response.body)
     } else if let Some(json) = response.body_json() {
         meta_from_json(&json)
@@ -689,6 +704,53 @@ mod tests {
         assert!(!out.contains("AKIAIOSFODNN7EXAMPLE"), "secret survived reassembly: {out}");
         assert!(out.contains("done"), "completion text lost: {out}");
         assert!(out.contains("REDACTED:CLOUD_KEY:"), "no redaction marker: {out}");
+    }
+
+    #[test]
+    fn stream_requested_but_json_body_still_records_meta() {
+        // Regression: the client asked for `stream:true`, but the upstream replied
+        // with a buffered (non-SSE) JSON body — the provider ignored the flag, or
+        // it's an error body. The parser must key off the RESPONSE shape (JSON),
+        // NOT the request flag; otherwise `reassemble_sse` runs over the JSON,
+        // finds no `data:` lines, and silently drops tokens / finish-reason / cost.
+        let ctx = ctx_with(CapturePolicy::default());
+        let request = req(br#"{"model":"gpt-4o","stream":true,"messages":[]}"#);
+        // NON-SSE: content-type application/json, a normal buffered completion body.
+        let response = json_resp(
+            200,
+            br#"{"model":"gpt-4o","usage":{"prompt_tokens":11,"completion_tokens":5},"choices":[{"finish_reason":"stop"}]}"#,
+        );
+        let price = ModelPrice {
+            input_per_mtok: 3.0,
+            output_per_mtok: 15.0,
+        };
+        let ev = record_llm_event(
+            &ctx,
+            RecordInputs {
+                provider: Provider::OpenAi,
+                request: &request,
+                response: &response,
+                price: Some(price),
+                timestamp: MicrosTimestamp(1),
+                duration_ms: None,
+            },
+        );
+
+        let llm = ev.blocks.llm.as_ref().unwrap();
+        // The metadata from the JSON body is recorded (NOT dropped to defaults).
+        assert_eq!(llm.input_tokens, Some(11), "input tokens dropped on stream-flag false-positive");
+        assert_eq!(llm.output_tokens, Some(5), "output tokens dropped on stream-flag false-positive");
+        assert_eq!(llm.total_tokens, Some(16));
+        assert_eq!(llm.finish_reason.as_deref(), Some("stop"), "finish_reason dropped");
+        assert_eq!(llm.model.as_deref(), Some("gpt-4o"));
+        // Cost is derivable now that tokens survived: 11*3/1e6 + 5*15/1e6.
+        let cost = llm.cost_usd.expect("cost should be derived from recovered tokens");
+        let expected = (11.0 * 3.0 + 5.0 * 15.0) / 1_000_000.0;
+        assert!((cost - expected).abs() < 1e-12, "got {cost}, want {expected}");
+        // The recorded `stream` flag still reflects that streaming was requested —
+        // the request flag drives the FLAG, just not the parser choice.
+        assert_eq!(llm.stream, Some(true), "stream flag should still reflect the request");
+        assert_eq!(ev.attributes.get("stream"), Some(&serde_json::Value::Bool(true)));
     }
 
     #[test]

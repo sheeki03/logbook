@@ -720,7 +720,10 @@ fn normalize_browser_event(event: &BrowserEvent, trace: TraceId, redactor: &Reda
         .as_deref()
         .unwrap_or("info")
         .to_ascii_lowercase();
-    let kind = event.kind.as_deref().unwrap_or("console").to_string();
+    // Redact + length-cap `kind` before it becomes the persisted event `type`
+    // (plan §9): like message/url/stack/meta, it is client-supplied free text
+    // and must not leak secrets or smuggle an oversized blob into the store.
+    let kind = truncate_with_ellipsis(&redactor.redact(event.kind.as_deref().unwrap_or("console")), 64);
 
     let mut message = event.message.clone().unwrap_or_default();
     if let Some(args) = &event.args {

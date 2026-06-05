@@ -144,10 +144,22 @@ pub struct FindingPage {
 /// (`Kind::Finding` carrying a [`FindingBlock`](logbook_core::FindingBlock)).
 /// They are read through the same [`StoreQuery`] path as `/api/events` (so the
 /// indexes are reused), then post-filtered by severity in Rust: severity lives
-/// in the JSON `FindingBlock`, not a column, and ranking here via the core
-/// [`Severity`] `Ord` keeps the SQL simple and the ordering stable (newest
-/// first). Everything read is already redacted at write time, so it is safe to
-/// ship to the browser.
+/// in the JSON `FindingBlock`, not a column, so a SQL `WHERE severity >= ?`
+/// predicate is not available. Ranking here via the core [`Severity`] `Ord`
+/// keeps the ordering stable (newest first). Everything read is already redacted
+/// at write time, so it is safe to ship to the browser.
+///
+/// **Why the floor changes the fetch size.** Because the floor is a Rust
+/// post-filter, fetching only the user `limit` newest Security events and *then*
+/// filtering is a false-negative trap: a store with more than `limit` newer
+/// low-severity findings would fill the candidate set entirely, leaving the
+/// genuinely-severe (but older) findings unfetched, so `?severity=critical`
+/// could report zero criticals even though they exist. To avoid that, when a
+/// floor is set we fetch a larger candidate set (up to [`MAX_LIMIT`] Security
+/// events, newest-first), apply the floor, and only then truncate to the user
+/// `limit` — so the user sees the newest `limit` findings that actually clear
+/// the bar. The no-floor path is unchanged: there is nothing to drop, so the
+/// store `LIMIT` already yields exactly the right rows.
 pub async fn findings(
     State(state): State<AppState>,
     Query(params): Query<FindingParams>,
@@ -162,24 +174,43 @@ pub async fn findings(
         None => None,
     };
     let limit = params.limit.unwrap_or(DEFAULT_LIMIT).min(MAX_LIMIT);
-    let query = StoreQuery::new().category(Category::Security).limit(limit);
-    let events = state.store.query(&query)?;
 
-    // Min-severity post-filter, comparing against the core ordering (Info < Low
-    // < … < Critical). A finding with no severity is conservatively dropped when
-    // a floor is set (it cannot be shown to clear the bar).
     let findings = match min_severity {
-        None => events,
-        Some(min) => events
-            .into_iter()
-            .filter(|e| {
-                e.blocks
-                    .finding
-                    .as_ref()
-                    .and_then(|f| f.severity)
-                    .is_some_and(|sev| sev >= min)
-            })
-            .collect(),
+        // No floor: the store LIMIT already returns exactly the rows we ship, so
+        // fetch just `limit` (cheapest path, unchanged behavior).
+        None => {
+            let query = StoreQuery::new().category(Category::Security).limit(limit);
+            state.store.query(&query)?
+        }
+        // A floor is set: the severity filter is a Rust post-filter (severity is
+        // not a SQL column), so fetching only `limit` rows and then filtering
+        // could drop *every* candidate while severe-but-older findings sit just
+        // past the cutoff. Fetch a larger candidate set (up to MAX_LIMIT,
+        // newest-first), apply the floor, then truncate to the user `limit`.
+        Some(min) => {
+            let query = StoreQuery::new()
+                .category(Category::Security)
+                .limit(MAX_LIMIT);
+            let mut matched: Vec<Event> = state
+                .store
+                .query(&query)?
+                .into_iter()
+                // Compare against the core ordering (Info < Low < … < Critical).
+                // A finding with no severity is conservatively dropped when a
+                // floor is set (it cannot be shown to clear the bar).
+                .filter(|e| {
+                    e.blocks
+                        .finding
+                        .as_ref()
+                        .and_then(|f| f.severity)
+                        .is_some_and(|sev| sev >= min)
+                })
+                .collect();
+            // The candidates are already newest-first, so truncating keeps the
+            // newest `limit` findings that clear the floor.
+            matched.truncate(limit as usize);
+            matched
+        }
     };
     Ok(Json(FindingPage { findings }))
 }

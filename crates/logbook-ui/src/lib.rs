@@ -475,6 +475,76 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn findings_endpoint_severity_floor_survives_limit_of_low_findings() {
+        // Regression: the severity floor is a Rust post-filter, so it must run
+        // against a candidate set large enough to *reach* the severe findings.
+        // Seed MANY low (Info) findings that are all NEWER than a single High
+        // finding, then more of them than the request `limit`. With the old
+        // "fetch `limit` newest, then filter" logic, the High finding sits just
+        // past the newest-`limit` window and `?severity=high` returns ZERO — a
+        // false negative on the Risk feed. The fix fetches a larger candidate
+        // set, applies the floor, then truncates, so the High finding survives.
+        let store = Store::open_in_memory().unwrap();
+        let trace = TraceId::new();
+
+        // The lone High finding is the OLDEST event (ts=1), so a naive
+        // newest-first store LIMIT would exclude it once enough newer Info
+        // findings exist.
+        let mut high = Event::new(trace, Kind::Finding, Category::Security, "advisory")
+            .with_finding(FindingBlock {
+                source: Some("detect".into()),
+                rule_id: Some("secret_in_diff".into()),
+                severity: Some(Severity::High),
+                file: Some("src/config.rs".into()),
+                line: Some(7),
+                message: Some("a secret was present in a code change".into()),
+            });
+        high.timestamp = logbook_core::MicrosTimestamp(1);
+        store.insert(&high).unwrap();
+
+        // Plant far more newer Info findings than the `limit` we will request,
+        // so they would fully occupy a newest-`limit` candidate window.
+        let request_limit = 5_u32;
+        let low_count = (request_limit as i64) * 4; // 20 Info findings, all newer.
+        for i in 0..low_count {
+            let mut info = Event::new(trace, Kind::Finding, Category::Security, "advisory")
+                .with_finding(FindingBlock {
+                    source: Some("detect".into()),
+                    rule_id: Some("tool_call_rate".into()),
+                    severity: Some(Severity::Info),
+                    message: Some("informational rate note".into()),
+                    ..Default::default()
+                });
+            // ts strictly greater than the High finding's ts=1.
+            info.timestamp = logbook_core::MicrosTimestamp(1_000 + i);
+            store.insert(&info).unwrap();
+        }
+
+        let app = app(AppState::new(store, EventBus::new()));
+        // Request a small limit so the newest Info findings alone would exhaust
+        // it; `?severity=high` must STILL surface the older High finding.
+        let uri = format!("/api/findings?severity=high&limit={request_limit}");
+        let (status, json) = get_json(&app, &uri).await;
+        assert_eq!(status, StatusCode::OK);
+        let findings = json["findings"].as_array().unwrap();
+        assert_eq!(
+            findings.len(),
+            1,
+            "the single High finding must survive the floor despite {low_count} newer Info findings and limit={request_limit}, got {json}"
+        );
+        assert_eq!(findings[0]["finding"]["severity"], "high");
+        assert_eq!(findings[0]["finding"]["rule_id"], "secret_in_diff");
+
+        // And it must not over-return: the Info findings stay filtered out.
+        assert!(
+            findings
+                .iter()
+                .all(|f| f["finding"]["severity"] == "high"),
+            "only High findings should pass the floor, got {json}"
+        );
+    }
+
+    #[tokio::test]
     async fn findings_endpoint_rejects_unknown_severity() {
         let app = app(AppState::new(seed_findings(), EventBus::new()));
         let (status, json) = get_json(&app, "/api/findings?severity=spicy").await;

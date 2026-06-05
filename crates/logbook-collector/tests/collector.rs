@@ -171,6 +171,44 @@ async fn ingest_redacts_secrets_before_persisting() {
 }
 
 #[tokio::test]
+async fn ingest_redacts_event_kind_before_persisting() {
+    // Regression: the client-supplied `kind` becomes the persisted event `type`.
+    // Like every other free-text field it must be redacted before persistence
+    // (plan §9) — a secret in `kind` must never reach the store unredacted.
+    let (running, store, _dir) = start_test_collector().await;
+    let url = format!("http://127.0.0.1:{}/ingest", running.port());
+    let token = running.token().unwrap().to_string();
+
+    let resp = reqwest::Client::new()
+        .post(&url)
+        .bearer_auth(&token)
+        .json(&serde_json::json!({"events": [{
+            "kind": "AKIAIOSFODNN7EXAMPLE",
+            "message": "hi"
+        }]}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 204);
+
+    let events = store
+        .query(&Query::new().category(logbook_core::Category::Browser))
+        .unwrap();
+    assert_eq!(events.len(), 1);
+    let stored_type = &events[0].type_;
+    assert!(
+        !stored_type.contains("AKIAIOSFODNN7EXAMPLE"),
+        "secret leaked into the persisted event type: {stored_type}"
+    );
+    assert!(
+        stored_type.contains("REDACTED"),
+        "secret-shaped kind should be redacted in the event type: {stored_type}"
+    );
+
+    running.shutdown().await;
+}
+
+#[tokio::test]
 async fn collector_token_is_0600_and_json_has_no_secret() {
     let (running, _store, dir) = start_test_collector().await;
     let token = running.token().unwrap().to_string();
