@@ -975,6 +975,7 @@ dependencies = [
  "logbook-collector",
  "logbook-core",
  "logbook-debug",
+ "logbook-detect",
  "logbook-export",
  "logbook-harness",
  "logbook-inventory",
@@ -1039,6 +1040,14 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "logbook-detect"
+version = "0.1.0"
+dependencies = [
+ "logbook-core",
+ "serde_json",
 ]
 
 [[package]]
