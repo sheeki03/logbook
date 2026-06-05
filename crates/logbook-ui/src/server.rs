@@ -17,13 +17,14 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use axum::routing::get;
 use axum::Router;
 use tokio::net::TcpListener;
-use tower_http::cors::{Any, CorsLayer};
+use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
 
 use logbook_store::Store;
 
 use crate::api;
 use crate::bus::EventBus;
+use crate::capture;
 use crate::embed::static_handler;
 use crate::sse;
 use crate::state::AppState;
@@ -60,16 +61,35 @@ impl Default for UiConfig {
 /// callers that want to mount it inside a larger server.
 pub fn app(state: AppState) -> Router {
     // The UI is served same-origin in production (embedded) and via the Vite
-    // dev proxy in development, so permissive CORS is only relevant to the
-    // read-only JSON APIs on loopback. Keep it to GETs.
+    // dev proxy in development, so *no permissive CORS is needed*: a same-origin
+    // page (embedded UI) or the dev proxy (which forwards server-side, arriving
+    // as a same-origin request to the Vite origin) never triggers a cross-origin
+    // CORS check. Critically, we must NOT advertise a wildcard `allow_origin`
+    // here: the capture endpoint's per-process CSRF token relies on a cross-origin
+    // attacker being unable to *read* the `GET /api/capture-policy` response (see
+    // `capture::set_capture_policy`); `allow_origin(Any)` would defeat exactly
+    // that by letting any origin read the token. With no `allow_origin` set, the
+    // layer emits no `Access-Control-Allow-Origin`, so the browser blocks
+    // cross-origin reads of the API and the token stays confidential. We still
+    // declare the methods + the CSRF header so that if a future same-origin
+    // preflight is issued it is answered, without ever reflecting a foreign origin.
     let cors = CorsLayer::new()
-        .allow_methods([axum::http::Method::GET])
-        .allow_origin(Any);
+        .allow_methods([axum::http::Method::GET, axum::http::Method::POST])
+        .allow_headers([
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderName::from_static(capture::CSRF_HEADER),
+        ]);
 
     Router::new()
         .route("/api/events", get(api::events))
         .route("/api/timeline", get(api::timeline))
         .route("/api/inventory", get(api::inventory))
+        .route("/api/sessions", get(api::sessions))
+        .route("/api/sessions/{id}", get(api::session))
+        .route(
+            "/api/capture-policy",
+            get(capture::get_capture_policy).post(capture::set_capture_policy),
+        )
         .route("/api/stream", get(sse::stream))
         // Static + SPA fallback for everything else.
         .fallback(static_handler)
@@ -164,6 +184,17 @@ pub async fn bind(config: &UiConfig, state: AppState) -> std::io::Result<UiServe
 /// Returns a bind or serve error.
 pub async fn serve(config: &UiConfig, store: Store, bus: EventBus) -> std::io::Result<()> {
     let server = bind(config, AppState::new(store, bus)).await?;
+    server.serve().await
+}
+
+/// Bind + serve over a fully-built [`AppState`]. The CLI uses this to inject the
+/// capture-toggle write surface (out-dir, config root, `--allow-config-write`)
+/// built via [`AppState::with_capture`], which [`serve`] cannot express.
+///
+/// # Errors
+/// Returns a bind or serve error.
+pub async fn serve_with_state(config: &UiConfig, state: AppState) -> std::io::Result<()> {
+    let server = bind(config, state).await?;
     server.serve().await
 }
 

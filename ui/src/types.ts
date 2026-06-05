@@ -165,3 +165,86 @@ export interface Inventory {
 export interface EventPage {
   events: AgentEvent[];
 }
+
+// ---- Session replay DTOs (Orbit plan §1.4) ----
+
+// One row in the Sessions master list: the agent_sessions header plus the
+// recorded action count and a has-transcript flag.
+export interface SessionSummary {
+  session_id: string;
+  agent: string;
+  command: string;
+  started_at: number; // microseconds since UNIX epoch
+  ended_at?: number;
+  exit_code?: number;
+  action_count: number;
+  has_transcript: boolean;
+}
+
+// Transcript pointers + metadata (the redacted files live on disk).
+export interface SessionTranscript {
+  terminal_log_path?: string;
+  text_path?: string;
+  line_count?: number;
+  byte_size?: number;
+}
+
+// One recorded file-diff action. `diff_bytes > len(diff)` flags a truncated
+// body; `revert_safe` flags a clean-tree (git-revertable) change.
+export interface SessionAction {
+  kind: string;
+  path?: string;
+  diff?: string;
+  diff_bytes?: number;
+  post_hash?: string;
+  revert_safe: boolean;
+}
+
+// The full per-session replay payload returned by GET /api/sessions/:id.
+export interface SessionDetail {
+  session: SessionSummary;
+  transcript?: SessionTranscript;
+  actions: SessionAction[];
+  events: AgentEvent[];
+}
+
+export interface SessionPage {
+  sessions: SessionSummary[];
+}
+
+// ---- Capture policy DTOs (Orbit plan §1.4) ----
+
+// Effective per-class capture booleans (secrets is the locked floor, not here).
+export interface CaptureClassEnabled {
+  transcript: boolean;
+  prompts: boolean;
+  tool_args: boolean;
+  tool_results: boolean;
+  file_diffs: boolean;
+  commands: boolean;
+  browser_data: boolean;
+  model_metadata: boolean;
+}
+
+// The addressable per-class capture toggle keys (secrets excluded).
+export type CaptureClass = keyof CaptureClassEnabled;
+
+// GET /api/capture-policy: the effective policy + the CSRF token + the
+// conflict-detection version + the config-write capability.
+export interface CapturePolicyView {
+  enabled: boolean;
+  classes: CaptureClassEnabled;
+  secrets_locked: boolean;
+  allow_config_write: boolean;
+  csrf_token: string;
+  version: string;
+}
+
+// POST /api/capture-policy body. `target` chooses the runtime overlay
+// (capture-state.json, default) or the durable logbook.toml (gated).
+export interface CapturePolicyUpdate {
+  target?: "runtime" | "config";
+  enabled?: boolean;
+  classes?: Partial<Record<CaptureClass, boolean>>;
+  expected_version?: string;
+}

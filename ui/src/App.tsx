@@ -2,8 +2,15 @@ import { useState } from "react";
 
 import { Timeline } from "./views/Timeline";
 import { Inventory } from "./views/Inventory";
+import { Sessions } from "./views/Sessions";
 
-type View = "timeline" | "inventory";
+type View = "timeline" | "sessions" | "inventory";
+
+const NAV: { id: View; label: string }[] = [
+  { id: "timeline", label: "Timeline" },
+  { id: "sessions", label: "Sessions" },
+  { id: "inventory", label: "Inventory" },
+];
 
 export default function App() {
   const [view, setView] = useState<View>("timeline");
@@ -16,24 +23,22 @@ export default function App() {
           <span className="tagline">local observability for agent-built software</span>
         </div>
         <nav className="main-nav">
-          <button
-            className={view === "timeline" ? "active" : ""}
-            onClick={() => setView("timeline")}
-            type="button"
-          >
-            Timeline
-          </button>
-          <button
-            className={view === "inventory" ? "active" : ""}
-            onClick={() => setView("inventory")}
-            type="button"
-          >
-            Inventory
-          </button>
+          {NAV.map((n) => (
+            <button
+              key={n.id}
+              className={view === n.id ? "active" : ""}
+              onClick={() => setView(n.id)}
+              type="button"
+            >
+              {n.label}
+            </button>
+          ))}
         </nav>
       </header>
       <main className="app-main">
-        {view === "timeline" ? <Timeline /> : <Inventory />}
+        {view === "timeline" && <Timeline />}
+        {view === "sessions" && <Sessions />}
+        {view === "inventory" && <Inventory />}
       </main>
     </div>
   );

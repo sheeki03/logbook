@@ -19,6 +19,7 @@ rust-embed = { version = "8.11.0", features = ["mime-guess"] }
 rustix = { version = "1", features = ["process"] }
 serde.workspace = true
 serde_json.workspace = true
+toml = "1.1"
 tokio = { workspace = true, features = ["rt-multi-thread", "net", "sync", "macros", "signal", "time"] }
 tokio-stream = { version = "0.1.18", features = ["sync"] }
 tower-http = { version = "0.6.11", features = ["cors", "trace"] }

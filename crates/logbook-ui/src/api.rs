@@ -15,6 +15,7 @@ use logbook_core::{Category, Event};
 use logbook_store::Query as StoreQuery;
 
 use crate::inventory::{self, InventorySnapshot};
+use crate::sessions::{self, SessionDetail, SessionSummary};
 use crate::state::AppState;
 
 /// Default row cap for event queries when the client does not specify one.
@@ -114,6 +115,33 @@ pub async fn inventory(
     Ok(Json(snapshot))
 }
 
+/// The `{ "sessions": [...] }` response envelope for the master list.
+#[derive(Debug, Serialize)]
+pub struct SessionPage {
+    /// The recorded sessions, newest-first.
+    pub sessions: Vec<SessionSummary>,
+}
+
+/// `GET /api/sessions` — newest-first master list of recorded agent sessions
+/// (Orbit plan §1.4), each with its action count and a has-transcript flag.
+pub async fn sessions(State(state): State<AppState>) -> Result<Json<SessionPage>, ApiError> {
+    let sessions = sessions::list_sessions(&state.store)?;
+    Ok(Json(SessionPage { sessions }))
+}
+
+/// `GET /api/sessions/:id` — the full replay detail for one session: header,
+/// transcript pointers, recorded diffs, and the ordered event stream. A missing
+/// session is a `404` (via [`ApiError::not_found`]).
+pub async fn session(
+    State(state): State<AppState>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Result<Json<SessionDetail>, ApiError> {
+    match sessions::load_session(&state.store, &id)? {
+        Some(detail) => Ok(Json(detail)),
+        None => Err(ApiError::not_found(format!("no session: {id}"))),
+    }
+}
+
 /// API error wrapper.
 ///
 /// - An internal failure (e.g. a store error, surfaced via `?`) becomes a 500
@@ -126,6 +154,9 @@ pub async fn inventory(
 pub enum ApiError {
     /// Invalid client input → `400 Bad Request`; the message is returned.
     BadRequest(String),
+    /// No such resource → `404 Not Found`; the message is returned (it names the
+    /// missing id and carries no sensitive detail).
+    NotFound(String),
     /// Server-side failure → `500 Internal Server Error`; message is logged only.
     Internal(anyhow::Error),
 }
@@ -134,6 +165,11 @@ impl ApiError {
     /// Construct a `400 Bad Request` carrying a client-facing message.
     pub fn bad_request(message: impl Into<String>) -> Self {
         Self::BadRequest(message.into())
+    }
+
+    /// Construct a `404 Not Found` carrying a client-facing message.
+    pub fn not_found(message: impl Into<String>) -> Self {
+        Self::NotFound(message.into())
     }
 }
 
@@ -151,6 +187,10 @@ impl IntoResponse for ApiError {
         match self {
             ApiError::BadRequest(message) => {
                 (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": message })))
+                    .into_response()
+            }
+            ApiError::NotFound(message) => {
+                (StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": message })))
                     .into_response()
             }
             ApiError::Internal(err) => {
@@ -242,6 +282,7 @@ mod tests {
                 msg.contains("securty"),
                 "message should name the bad token, got {msg}"
             ),
+            ApiError::NotFound(m) => panic!("expected BadRequest, got NotFound: {m}"),
             ApiError::Internal(e) => panic!("expected BadRequest, got Internal: {e}"),
         }
     }

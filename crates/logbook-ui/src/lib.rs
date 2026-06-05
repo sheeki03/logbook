@@ -37,17 +37,23 @@
 
 pub mod api;
 pub mod bus;
+pub mod capture;
 pub mod embed;
 pub mod inventory;
 pub mod server;
+pub mod sessions;
 pub mod sse;
 pub mod state;
 
 pub use bus::EventBus;
+pub use capture::{CapturePolicyUpdate, CapturePolicyView, WriteTarget, CSRF_HEADER};
 pub use inventory::{
     AgentInstall, AgentSession, Endpoint, InventoryFinding, InventorySnapshot, McpServer,
 };
-pub use server::{app, bind, serve, UiConfig, UiServer, DEFAULT_PORT};
+pub use server::{app, bind, serve, serve_with_state, UiConfig, UiServer, DEFAULT_PORT};
+pub use sessions::{
+    list_sessions, load_session, SessionAction, SessionDetail, SessionSummary, SessionTranscript,
+};
 pub use state::AppState;
 
 #[cfg(test)]
@@ -308,5 +314,262 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK, "SPA fallback should return 200");
+    }
+
+    // ───────────────── sessions endpoints (Orbit §1.4) ─────────────────
+
+    /// Plant one full session (header + transcript + actions + a trace event).
+    fn seed_session(store: &Store) -> TraceId {
+        let trace = TraceId::new();
+        let trace_hex = trace.to_hex();
+        store
+            .write(move |conn| {
+                conn.execute(
+                    "INSERT INTO agent_sessions \
+                       (id, endpoint_id, agent, command, trace_id, started_at, ended_at, exit_code) \
+                     VALUES ('s1', NULL, 'claude', 'claude -- build', ?1, 100, 200, 0)",
+                    [&trace_hex],
+                )?;
+                conn.execute_batch(
+                    "INSERT INTO session_transcripts \
+                       (session_id, trace_id, terminal_log_path, text_path, line_count, byte_size, max_sensitivity, created_at) \
+                       VALUES ('s1', 'tr', '/o/s.terminal.log', '/o/s.txt', 7, 999, 'transcript', 150);
+                     INSERT INTO agent_actions \
+                       (id, session_id, kind, path, detail, observed_at, diff, diff_bytes, post_hash, revert_safe, max_sensitivity) \
+                       VALUES ('a1', 's1', 'file_modified', 'f.txt', NULL, 160, '@@ -1 +1 @@\n-x\n+y', 17, 'h', 1, 'file_diffs');",
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        let mut ev = Event::new(trace, Kind::Log, Category::Agent, "run")
+            .with_name("echo hi")
+            .with_status(Status::Ok)
+            .with_session(logbook_core::SessionId::new("s1"));
+        ev.timestamp = logbook_core::MicrosTimestamp(155);
+        store.insert(&ev).unwrap();
+        trace
+    }
+
+    #[tokio::test]
+    async fn sessions_endpoint_lists_with_counts() {
+        let store = Store::open_in_memory().unwrap();
+        seed_session(&store);
+        let app = app(AppState::new(store, EventBus::new()));
+        let (status, json) = get_json(&app, "/api/sessions").await;
+        assert_eq!(status, StatusCode::OK);
+        let sessions = json["sessions"].as_array().unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0]["session_id"], "s1");
+        assert_eq!(sessions[0]["action_count"], 1);
+        assert_eq!(sessions[0]["has_transcript"], true);
+        assert_eq!(sessions[0]["exit_code"], 0);
+    }
+
+    #[tokio::test]
+    async fn session_detail_endpoint_replays_transcript_actions_events() {
+        let store = Store::open_in_memory().unwrap();
+        seed_session(&store);
+        let app = app(AppState::new(store, EventBus::new()));
+        let (status, json) = get_json(&app, "/api/sessions/s1").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["session"]["session_id"], "s1");
+        assert_eq!(json["transcript"]["terminal_log_path"], "/o/s.terminal.log");
+        assert_eq!(json["transcript"]["line_count"], 7);
+        let actions = json["actions"].as_array().unwrap();
+        assert_eq!(actions.len(), 1);
+        assert_eq!(actions[0]["kind"], "file_modified");
+        assert_eq!(actions[0]["revert_safe"], true);
+        assert_eq!(actions[0]["diff_bytes"], 17);
+        // The ordered trace stream carries the planted command event.
+        let events = json["events"].as_array().unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["name"], "echo hi");
+    }
+
+    #[tokio::test]
+    async fn session_detail_missing_is_404() {
+        let store = Store::open_in_memory().unwrap();
+        let app = app(AppState::new(store, EventBus::new()));
+        let (status, json) = get_json(&app, "/api/sessions/nope").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert!(json["error"].as_str().unwrap_or_default().contains("nope"));
+    }
+
+    // ───────────────── capture-policy endpoint (Orbit §1.4) ─────────────────
+
+    /// A state pointed at a temp out-dir, with the given config-write capability.
+    fn capture_state(out_dir: &std::path::Path, allow_config_write: bool) -> AppState {
+        AppState::new(Store::open_in_memory().unwrap(), EventBus::new())
+            .with_capture(out_dir.to_path_buf(), out_dir.to_path_buf(), allow_config_write)
+    }
+
+    async fn post_json(
+        app: &axum::Router,
+        uri: &str,
+        csrf: Option<&str>,
+        body: serde_json::Value,
+    ) -> (StatusCode, serde_json::Value) {
+        let mut req = Request::builder()
+            .method("POST")
+            .uri(uri)
+            .header("content-type", "application/json");
+        if let Some(token) = csrf {
+            req = req.header(crate::capture::CSRF_HEADER, token);
+        }
+        let resp = app
+            .clone()
+            .oneshot(req.body(Body::from(body.to_string())).unwrap())
+            .await
+            .unwrap();
+        let status = resp.status();
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let json = if bytes.is_empty() {
+            serde_json::Value::Null
+        } else {
+            serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null)
+        };
+        (status, json)
+    }
+
+    #[tokio::test]
+    async fn capture_policy_get_exposes_token_and_locked_secrets() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = app(capture_state(tmp.path(), false));
+        let (status, json) = get_json(&app, "/api/capture-policy").await;
+        assert_eq!(status, StatusCode::OK);
+        // Recorder-on defaults (no logbook.toml present).
+        assert_eq!(json["enabled"], true);
+        assert_eq!(json["classes"]["file_diffs"], true);
+        assert_eq!(json["secrets_locked"], true);
+        assert_eq!(json["allow_config_write"], false);
+        assert!(json["csrf_token"].as_str().unwrap().len() >= 16);
+        assert_eq!(json["version"], "absent");
+    }
+
+    #[tokio::test]
+    async fn capture_policy_post_without_csrf_is_forbidden() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = app(capture_state(tmp.path(), false));
+        let (status, _json) =
+            post_json(&app, "/api/capture-policy", None, serde_json::json!({ "enabled": false }))
+                .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        // No capture-state.json should have been written.
+        assert!(!tmp.path().join("capture-state.json").exists());
+    }
+
+    #[tokio::test]
+    async fn capture_policy_post_runtime_writes_overlay_cross_process() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = app(capture_state(tmp.path(), false));
+        // Read the CSRF token first.
+        let (_s, view) = get_json(&app, "/api/capture-policy").await;
+        let token = view["csrf_token"].as_str().unwrap();
+
+        // Pause capture via the runtime overlay.
+        let (status, json) = post_json(
+            &app,
+            "/api/capture-policy",
+            Some(token),
+            serde_json::json!({ "target": "runtime", "enabled": false }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["enabled"], false, "resolved policy reflects the pause");
+
+        // The cross-process file is written, and a fresh resolve sees master-off.
+        let state_path = tmp.path().join("capture-state.json");
+        assert!(state_path.exists(), "capture-state.json must be written");
+        let resolved = logbook_core::CapturePolicy::resolve(
+            tmp.path(),
+            tmp.path(),
+            logbook_core::CliOverlay::default(),
+        );
+        assert!(!resolved.enabled, "subsequent producers see the pause");
+    }
+
+    #[tokio::test]
+    async fn capture_policy_post_config_target_is_gated() {
+        let tmp = tempfile::tempdir().unwrap();
+        // allow_config_write = false -> config target rejected.
+        let app = app(capture_state(tmp.path(), false));
+        let (_s, view) = get_json(&app, "/api/capture-policy").await;
+        let token = view["csrf_token"].as_str().unwrap();
+        let (status, _json) = post_json(
+            &app,
+            "/api/capture-policy",
+            Some(token),
+            serde_json::json!({ "target": "config", "enabled": false }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "config write needs --allow-config-write");
+        assert!(!tmp.path().join("logbook.toml").exists());
+    }
+
+    #[tokio::test]
+    async fn capture_policy_post_config_target_when_allowed_writes_toml() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = app(capture_state(tmp.path(), true));
+        let (_s, view) = get_json(&app, "/api/capture-policy").await;
+        let token = view["csrf_token"].as_str().unwrap();
+        let (status, _json) = post_json(
+            &app,
+            "/api/capture-policy",
+            Some(token),
+            serde_json::json!({ "target": "config", "classes": { "file_diffs": false } }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let toml_path = tmp.path().join("logbook.toml");
+        assert!(toml_path.exists(), "logbook.toml must be written");
+        // The durable config disables file_diffs but keeps the secrets floor.
+        let cfg = logbook_core::LogbookConfig::load_from_root(tmp.path()).unwrap();
+        assert!(!cfg.capture.classes.file_diffs.capture);
+        assert!(cfg.capture.classes.secrets.capture, "floor preserved");
+        assert!(cfg.capture.validate().is_ok());
+    }
+
+    #[tokio::test]
+    async fn capture_policy_post_detects_conflict() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = app(capture_state(tmp.path(), false));
+        let (_s, view) = get_json(&app, "/api/capture-policy").await;
+        let token = view["csrf_token"].as_str().unwrap().to_string();
+
+        // A stale expected_version (file is currently absent) -> 409.
+        let (status, _json) = post_json(
+            &app,
+            "/api/capture-policy",
+            Some(&token),
+            serde_json::json!({ "enabled": false, "expected_version": "stale:1:abc" }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn capture_policy_cross_site_fetch_is_rejected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = app(capture_state(tmp.path(), false));
+        let (_s, view) = get_json(&app, "/api/capture-policy").await;
+        let token = view["csrf_token"].as_str().unwrap().to_string();
+        // Even with a valid token, an explicit cross-site fetch is rejected.
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/capture-policy")
+                    .header("content-type", "application/json")
+                    .header(crate::capture::CSRF_HEADER, token)
+                    .header("sec-fetch-site", "cross-site")
+                    .body(Body::from(
+                        serde_json::json!({ "enabled": false }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
     }
 }

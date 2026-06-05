@@ -12,7 +12,7 @@ use std::path::PathBuf;
 use clap::Args;
 
 use logbook_store::Store;
-use logbook_ui::{serve, EventBus, UiConfig, DEFAULT_PORT};
+use logbook_ui::{serve_with_state, AppState, EventBus, UiConfig, DEFAULT_PORT};
 
 /// `logbook ui [opts]`.
 #[derive(Debug, Args)]
@@ -21,9 +21,24 @@ pub struct UiArgs {
     #[arg(long, default_value = super::DEFAULT_OUT_DIR)]
     pub out_dir: PathBuf,
 
+    /// Workspace root that holds `logbook.toml` (the durable `[capture]` write
+    /// target, gated behind `--allow-config-write`). Defaults to the current
+    /// directory, matching how capturing producers (`logbook run`/`agent`)
+    /// resolve their config root, so the UI writes `logbook.toml` to the same
+    /// place producers read it from.
+    #[arg(long, alias = "project")]
+    pub root: Option<PathBuf>,
+
     /// Preferred port; auto-increments on conflict.
     #[arg(long, default_value_t = DEFAULT_PORT)]
     pub port: u16,
+
+    /// Allow the Capture panel to persist the durable default into
+    /// `<root>/logbook.toml [capture]` (plan §1.4). Off by default — without it
+    /// the toggle still works but writes only the cross-process, narrow-only
+    /// `<out_dir>/capture-state.json` runtime override, never the config file.
+    #[arg(long, default_value_t = false)]
+    pub allow_config_write: bool,
 }
 
 /// Open the store and serve the UI until Ctrl-C / SIGTERM.
@@ -40,11 +55,28 @@ pub fn run(args: UiArgs) -> anyhow::Result<i32> {
         parent_pid: None,
     };
 
+    // Wire the Capture panel's write surface (plan §1.4): the runtime override
+    // lands in `<out_dir>/capture-state.json` (narrow-only, cross-process), and
+    // the durable `logbook.toml [capture]` write is gated behind
+    // `--allow-config-write`. The capture root (where `logbook.toml` lives)
+    // defaults to the current directory — the same root capturing producers
+    // (`logbook run`/`agent`) resolve via `std::env::current_dir()` — so the UI
+    // and producers agree on which `logbook.toml` to read/write.
+    let capture_root = args
+        .root
+        .clone()
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+    let state = AppState::new(store, bus).with_capture(
+        args.out_dir.clone(),
+        capture_root,
+        args.allow_config_write,
+    );
+
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
     rt.block_on(async move {
-        serve(&cfg, store, bus).await?;
+        serve_with_state(&cfg, state).await?;
         anyhow::Ok(())
     })?;
     Ok(0)

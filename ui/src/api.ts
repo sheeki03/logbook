@@ -2,7 +2,21 @@
 // the same bundle works whether it is served by the embedded axum server or
 // proxied through `vite dev`.
 
-import type { AgentEvent, Category, EventPage, Inventory } from "./types";
+import type {
+  AgentEvent,
+  Category,
+  CapturePolicyUpdate,
+  CapturePolicyView,
+  EventPage,
+  Inventory,
+  SessionDetail,
+  SessionPage,
+  SessionSummary,
+} from "./types";
+
+// The header the capture-toggle POST must echo the per-process CSRF token in.
+// Mirrors `logbook_ui::CSRF_HEADER`.
+const CSRF_HEADER = "x-logbook-csrf";
 
 async function getJson<T>(path: string, signal?: AbortSignal): Promise<T> {
   const res = await fetch(path, {
@@ -13,6 +27,17 @@ async function getJson<T>(path: string, signal?: AbortSignal): Promise<T> {
     throw new Error(`GET ${path} failed: ${res.status} ${res.statusText}`);
   }
   return (await res.json()) as T;
+}
+
+// Read a JSON error body's `error` field if present, for a useful message.
+async function errorText(res: Response): Promise<string> {
+  try {
+    const body = (await res.json()) as { error?: string };
+    if (body && typeof body.error === "string") return body.error;
+  } catch {
+    // fall through to the status line
+  }
+  return `${res.status} ${res.statusText}`;
 }
 
 export interface EventQuery {
@@ -56,6 +81,50 @@ export const api = {
   // Endpoint inventory snapshot (all five tabs in one payload).
   async inventory(signal?: AbortSignal): Promise<Inventory> {
     return getJson<Inventory>("/api/inventory", signal);
+  },
+
+  // Recorded agent sessions, newest-first (master list).
+  async sessions(signal?: AbortSignal): Promise<SessionSummary[]> {
+    const page = await getJson<SessionPage>("/api/sessions", signal);
+    return page.sessions;
+  },
+
+  // One session's full replay detail (header + transcript + diffs + events).
+  async session(id: string, signal?: AbortSignal): Promise<SessionDetail> {
+    return getJson<SessionDetail>(`/api/sessions/${encodeURIComponent(id)}`, signal);
+  },
+
+  // The effective capture policy + the CSRF token + the conflict version.
+  async getCapturePolicy(signal?: AbortSignal): Promise<CapturePolicyView> {
+    return getJson<CapturePolicyView>("/api/capture-policy", signal);
+  },
+
+  // Narrow/widen the capture policy. `view` carries the CSRF token + version
+  // from a prior `getCapturePolicy` so the write is authenticated and
+  // conflict-checked. Returns the freshly-resolved policy view.
+  async setCapturePolicy(
+    view: CapturePolicyView,
+    update: CapturePolicyUpdate,
+    signal?: AbortSignal,
+  ): Promise<CapturePolicyView> {
+    const body: CapturePolicyUpdate = {
+      ...update,
+      expected_version: update.expected_version ?? view.version,
+    };
+    const res = await fetch("/api/capture-policy", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        accept: "application/json",
+        [CSRF_HEADER]: view.csrf_token,
+      },
+      body: JSON.stringify(body),
+      signal,
+    });
+    if (!res.ok) {
+      throw new Error(`capture-policy update failed: ${await errorText(res)}`);
+    }
+    return (await res.json()) as CapturePolicyView;
   },
 };
 
