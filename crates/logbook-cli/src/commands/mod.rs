@@ -16,6 +16,7 @@ pub mod export;
 pub mod forget;
 pub mod guard;
 pub mod hooks;
+pub mod hub;
 pub mod inventory;
 pub mod mcp;
 pub mod proxy;

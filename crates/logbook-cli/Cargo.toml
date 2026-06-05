@@ -25,7 +25,13 @@ logbook-export = { version = "0.1.0", path = "../logbook-export" }
 # MCP transport routes redacted tool payloads through). Referenced by path,
 # matching logbook-collector: it is not (yet) a [workspace.dependencies] entry.
 logbook-harness = { version = "0.1.0", path = "../logbook-harness" }
+# logbook-hub powers `logbook hub serve` (the v1.5 loopback fleet receiver +
+# governance plane). Referenced by path, matching the other workspace members.
+logbook-hub = { version = "0.1.0", path = "../logbook-hub" }
 logbook-inventory = { version = "0.1.0", path = "../logbook-inventory" }
+# logbook-llmproxy powers `logbook proxy llm` (the Phase-4 Complete-tier provider
+# proxy, gated behind `--yes`). Referenced by path, matching the other members.
+logbook-llmproxy = { version = "0.1.0", path = "../logbook-llmproxy" }
 logbook-mcp = { version = "0.1.0", path = "../logbook-mcp" }
 logbook-security = { version = "0.1.0", path = "../logbook-security" }
 logbook-store = { version = "0.1.0", path = "../logbook-store" }

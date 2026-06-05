@@ -17,7 +17,8 @@
 //! | `debug`             | `logbook-debug`     |
 //! | `security`          | `logbook-security`  |
 //! | `export`            | `logbook-export`    |
-//! | `hub`               | (v1.5 placeholder)   |
+//! | `proxy llm`         | `logbook-llmproxy`  |
+//! | `hub`               | `logbook-hub`       |
 //!
 //! POSIX-only, matching OpenLogs: on Windows the binary prints a notice and
 //! exits `1` before doing anything else.
@@ -43,9 +44,9 @@ use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 use logbook_inventory::cli::{AgentArgs, InventoryArgs};
 
 use commands::{debug as debug_cmd, detect as detect_cmd, export as export_cmd,
-    forget as forget_cmd, guard as guard_cmd, hooks as hooks_cmd, mcp as mcp_cmd,
-    proxy as proxy_cmd, revert as revert_cmd, run as run_cmd, security as security_cmd,
-    session as session_cmd, ui as ui_cmd};
+    forget as forget_cmd, guard as guard_cmd, hooks as hooks_cmd, hub as hub_cmd,
+    mcp as mcp_cmd, proxy as proxy_cmd, revert as revert_cmd, run as run_cmd,
+    security as security_cmd, session as session_cmd, ui as ui_cmd};
 
 /// Local-first observability plane for agent-built software.
 #[derive(Debug, Parser)]
@@ -127,16 +128,9 @@ enum Command {
     /// follow-up.
     Guard(guard_cmd::GuardArgs),
 
-    /// logbook hub (v1.5) — receiver / retention / audit / RBAC.
-    Hub(HubArgs),
-}
-
-/// `logbook hub` — placeholder for the v1.5 fleet receiver (plan §10, §12).
-#[derive(Debug, clap::Args)]
-struct HubArgs {
-    /// Captured but ignored: the hub is not implemented in v1.
-    #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
-    rest: Vec<String>,
+    /// logbook hub (v1.5) — fleet receiver / retention / audit / RBAC.
+    /// `hub serve` runs the loopback, bearer-gated receiver.
+    Hub(hub_cmd::HubArgs),
 }
 
 fn main() -> ExitCode {
@@ -177,11 +171,7 @@ fn dispatch(command: Command) -> anyhow::Result<i32> {
         Command::Forget(args) => forget_cmd::run(args),
         Command::Detect(args) => detect_cmd::run(args),
         Command::Guard(args) => guard_cmd::run(args),
-        Command::Hub(_) => {
-            // Explicit v1 cut line (plan §12): announce + succeed.
-            println!("logbook hub: v1.5 — not yet implemented");
-            Ok(0)
-        }
+        Command::Hub(args) => hub_cmd::run(args),
     }
 }
 
