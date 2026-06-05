@@ -373,6 +373,13 @@ async fn proxy(
 
 /// Build the upstream response to relay back to the client, copying status +
 /// safe headers (dropping hop-by-hop / length headers axum will recompute).
+///
+/// RELAY/RECORD split (deliberate): this sends the **original** `resp.body`
+/// verbatim — still compressed, with the provider's `content-encoding` header
+/// preserved — so the client receives exactly what the provider sent and
+/// decompresses it itself. Only the *recorded* copy is decoded (in
+/// `record::decoded_body`, keyed off `content-encoding`); the bytes on the wire
+/// to the client are never decoded or otherwise altered here.
 fn relay_response(resp: &crate::upstream::UpstreamResponse) -> Response {
     let mut builder = Response::builder().status(resp.status);
     for (name, value) in &resp.headers {
@@ -382,6 +389,8 @@ fn relay_response(resp: &crate::upstream::UpstreamResponse) -> Response {
         builder = builder.header(name.as_str(), value.as_str());
     }
     builder
+        // Original (compressed) bytes — byte-exact relay; the recorded copy is
+        // the only thing that gets `Content-Encoding`-decoded.
         .body(axum::body::Body::from(resp.body.clone()))
         .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
 }
