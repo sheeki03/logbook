@@ -7,7 +7,7 @@
 use serde::Serialize;
 
 use crate::model::{AgentInstall, InventoryFinding, McpServer, RunningProcess, ToolPresence};
-use crate::scan::ScanReport;
+use crate::scan::{ScanReport, SessionStoreSummary};
 
 /// A JSON-serializable view of a scan report, organized into the five UI tabs
 /// (Endpoint · Agents · MCP Servers · Sessions · Risk/Shadow) plus tools.
@@ -23,6 +23,9 @@ pub struct ReportJson<'a> {
     pub processes: &'a [RunningProcess],
     /// Reusable-tool presence.
     pub tools: &'a [ToolPresence],
+    /// Native conversation stores discovered on disk (read-only). Observe-only:
+    /// what is *on disk*, not what is "unrecorded".
+    pub conversation_stores: &'a [SessionStoreSummary],
     /// Risk/shadow findings (redacted).
     pub findings: &'a [InventoryFinding],
     /// The scan's correlation trace id.
@@ -57,6 +60,7 @@ impl<'a> ReportJson<'a> {
             mcp_servers: &report.mcp_servers,
             processes: &report.processes,
             tools: &report.tools,
+            conversation_stores: &report.sessions,
             findings: &report.findings,
             trace_id: &report.trace_id,
         }
@@ -138,6 +142,10 @@ pub fn to_human(report: &ScanReport) -> String {
     }
     let _ = writeln!(s);
 
+    // Conversation Stores tab — native on-disk stores discovered read-only.
+    write_conversation_stores(&mut s, &report.sessions);
+    let _ = writeln!(s);
+
     // Tools
     let _ = writeln!(s, "Reusable tools:");
     for t in &report.tools {
@@ -169,6 +177,60 @@ pub fn to_human(report: &ScanReport) -> String {
     );
 
     s
+}
+
+/// Render the "Conversation Stores" section: native conversation stores found
+/// on disk, grouped per tool, with **honest wording**.
+///
+/// The scan discovers what is *on disk* — it holds no store handle to subtract
+/// sessions logbook has already imported — so it reports
+/// "N native conversation stores discovered", **never** "N unrecorded". Each
+/// tool line points at the `logbook import <tool>` command that would pull them
+/// onto the timeline, and the section footer makes the observe-only meaning
+/// explicit.
+fn write_conversation_stores(s: &mut String, sessions: &[SessionStoreSummary]) {
+    use std::collections::BTreeMap;
+    use std::fmt::Write as _;
+
+    let _ = writeln!(
+        s,
+        "Conversation Stores ({} discovered on disk, read-only):",
+        sessions.len()
+    );
+    if sessions.is_empty() {
+        let _ = writeln!(s, "  (no native conversation stores discovered)");
+        return;
+    }
+
+    // Group by tool, counting stores and tracking the most-recent last-active.
+    // BTreeMap keeps the per-tool output order stable (alphabetical).
+    let mut by_tool: BTreeMap<&str, (usize, Option<i64>)> = BTreeMap::new();
+    for store in sessions {
+        let entry = by_tool.entry(store.tool.as_str()).or_insert((0, None));
+        entry.0 += 1;
+        if let Some(la) = store.last_active {
+            entry.1 = Some(entry.1.map_or(la, |cur: i64| cur.max(la)));
+        }
+    }
+
+    for (tool, (count, last_active)) in &by_tool {
+        let noun = if *count == 1 { "store" } else { "stores" };
+        let last = match last_active {
+            Some(micros) => format!("  (last active {micros})"),
+            None => String::new(),
+        };
+        // Honest wording: "N native conversation stores discovered", not
+        // "N unrecorded".
+        let _ = writeln!(
+            s,
+            "  {tool:<10} {count} native conversation {noun} discovered  →  run `logbook import {tool}`{last}"
+        );
+    }
+    let _ = writeln!(
+        s,
+        "  (native stores found on disk; logbook has not necessarily imported them — \
+         run `logbook import <tool>` to pull them onto the timeline)"
+    );
 }
 
 #[cfg(test)]
@@ -207,6 +269,35 @@ mod tests {
                 present: true,
                 detail: Some("/x".into()),
             }],
+            sessions: vec![
+                SessionStoreSummary {
+                    tool: "cursor".into(),
+                    native_id: "composerData:abc".into(),
+                    import_id: "fp1:composerData:abc".into(),
+                    title: Some("Refactor scan".into()),
+                    last_active: Some(1_700_000_000_000_000),
+                    approx_messages: Some(12),
+                    workspace: Some("/home/me/proj".into()),
+                },
+                SessionStoreSummary {
+                    tool: "cursor".into(),
+                    native_id: "composerData:def".into(),
+                    import_id: "fp2:composerData:def".into(),
+                    title: None,
+                    last_active: None,
+                    approx_messages: Some(3),
+                    workspace: None,
+                },
+                SessionStoreSummary {
+                    tool: "gemini".into(),
+                    native_id: "sess-xyz".into(),
+                    import_id: "fp3:sess-xyz".into(),
+                    title: None,
+                    last_active: Some(1_700_000_500_000_000),
+                    approx_messages: Some(5),
+                    workspace: Some("proj-hash".into()),
+                },
+            ],
             findings: vec![InventoryFinding {
                 id: "f".into(),
                 kind: finding_kind::MCP_SECRET.into(),
@@ -239,6 +330,52 @@ mod tests {
         assert_eq!(v["agents"][0]["name"], "aider");
         assert_eq!(v["mcp_servers"][0]["has_secret"], true);
         assert_eq!(v["findings"][0]["severity"], "high");
+        // Conversation stores surface in JSON under their honest key.
+        assert_eq!(v["conversation_stores"][0]["tool"], "cursor");
+        assert_eq!(v["conversation_stores"][0]["import_id"], "fp1:composerData:abc");
+        assert_eq!(v["conversation_stores"][2]["tool"], "gemini");
+    }
+
+    #[test]
+    fn conversation_stores_section_uses_honest_wording_and_counts() {
+        let text = to_human(&sample());
+
+        // Section header carries the total on-disk count.
+        assert!(
+            text.contains("Conversation Stores (3 discovered on disk, read-only):"),
+            "missing section header in:\n{text}"
+        );
+        // Per-tool, honest "N native conversation stores discovered" wording —
+        // plural for cursor (2 stores), singular for gemini (1 store).
+        assert!(
+            text.contains("cursor     2 native conversation stores discovered"),
+            "missing cursor count line in:\n{text}"
+        );
+        assert!(
+            text.contains("gemini     1 native conversation store discovered"),
+            "missing gemini count line in:\n{text}"
+        );
+        // Each tool line points at the import command.
+        assert!(text.contains("run `logbook import cursor`"));
+        assert!(text.contains("run `logbook import gemini`"));
+        // It must NEVER claim "unrecorded" — the scan has no store handle to
+        // subtract already-imported sessions.
+        assert!(
+            !text.to_lowercase().contains("unrecorded"),
+            "scan must not claim 'unrecorded':\n{text}"
+        );
+        // The observe-only meaning is made explicit.
+        assert!(text.contains("has not necessarily imported them"));
+    }
+
+    #[test]
+    fn conversation_stores_section_handles_empty() {
+        let mut r = sample();
+        r.sessions.clear();
+        let text = to_human(&r);
+        assert!(text.contains("Conversation Stores (0 discovered on disk, read-only):"));
+        assert!(text.contains("(no native conversation stores discovered)"));
+        assert!(!text.to_lowercase().contains("unrecorded"));
     }
 
     #[test]

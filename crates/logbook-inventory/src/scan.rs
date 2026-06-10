@@ -23,6 +23,54 @@ use crate::processes::scan_processes;
 use crate::store_ext;
 use crate::tools::{scan_tools, ToolScanOptions};
 
+/// A slim, read-only projection of one native conversation store discovered by
+/// [`logbook_import::discover_all_sessions`].
+///
+/// We surface a local projection rather than leaking
+/// [`logbook_import::DiscoveredSession`] through the public [`ScanReport`]: the
+/// report is `Serialize` (rendered by [`crate::report`]) and decoupled, whereas
+/// the import type is a richer, non-serializable read handle (it carries a
+/// `SessionLocator` and reopen path). This summary keeps only what the
+/// "Conversation Stores" view needs and never carries payload bodies. It is
+/// **observe-only**: a count of what is *on disk*, not what is "unrecorded" (the
+/// scan has no store handle to subtract already-imported sessions).
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct SessionStoreSummary {
+    /// The tool that owns the store (`cursor`, `gemini`, `continue`).
+    pub tool: String,
+    /// The tool's native session key (human-readable; not globally unique).
+    pub native_id: String,
+    /// The globally-unique import selector (`{origin_fingerprint}:{native_key}`),
+    /// i.e. the `--session` argument to `logbook import <tool>`.
+    pub import_id: String,
+    /// A short human title for the session, if the store records one.
+    pub title: Option<String>,
+    /// Last-activity time in microseconds since the epoch, if the store records
+    /// one.
+    pub last_active: Option<i64>,
+    /// A bounded structural message count, if obtainable without parsing bodies.
+    pub approx_messages: Option<usize>,
+    /// The workspace/project this session belongs to, if known.
+    pub workspace: Option<String>,
+}
+
+impl SessionStoreSummary {
+    /// Project a [`logbook_import::DiscoveredSession`] into the slim summary, the
+    /// only `logbook-import` type that crosses into the public report.
+    #[must_use]
+    fn from_discovered(s: &logbook_import::DiscoveredSession) -> Self {
+        Self {
+            tool: s.tool.clone(),
+            native_id: s.native_id.clone(),
+            import_id: s.import_id.clone(),
+            title: s.title.clone(),
+            last_active: s.last_active.map(|t| t.as_micros()),
+            approx_messages: s.approx_messages,
+            workspace: s.workspace.clone(),
+        }
+    }
+}
+
 /// The full result of an inventory scan.
 #[derive(Clone, Debug)]
 pub struct ScanReport {
@@ -36,6 +84,11 @@ pub struct ScanReport {
     pub processes: Vec<RunningProcess>,
     /// Reusable-tool presence (schrute, security-suite, scanners).
     pub tools: Vec<ToolPresence>,
+    /// Native conversation stores discovered read-only on disk (Cursor/Gemini/
+    /// Continue), surfaced so the user can `logbook import <tool>` them. This is
+    /// observe-only: a body-free count of what is on disk, never a claim about
+    /// what is already recorded.
+    pub sessions: Vec<SessionStoreSummary>,
     /// Derived risk/shadow findings (already redacted).
     pub findings: Vec<InventoryFinding>,
     /// The correlation trace id for events emitted by this scan.
@@ -67,6 +120,10 @@ pub struct ScanContext {
     pub mcp: McpScanOptions,
     /// Tool discovery options.
     pub tools: ToolScanOptions,
+    /// Override for conversation-store discovery roots. `None` (the default)
+    /// uses [`logbook_import::discovery::resolve`] (the real per-OS data dirs);
+    /// tests inject a fixture dir via [`logbook_import::discovery::from_path`].
+    pub session_roots: Option<logbook_import::DataRoots>,
 }
 
 impl ScanContext {
@@ -81,10 +138,21 @@ impl ScanContext {
             agents: AgentScanOptions::default(),
             mcp: McpScanOptions::default(),
             tools: ToolScanOptions::with_home(&home),
+            session_roots: None,
             home,
             project,
             config,
         }
+    }
+
+    /// The conversation-store discovery roots for this context: the
+    /// [`session_roots`](Self::session_roots) override if set, else the real
+    /// per-OS data dirs.
+    #[must_use]
+    fn session_roots(&self) -> logbook_import::DataRoots {
+        self.session_roots
+            .clone()
+            .unwrap_or_else(logbook_import::discovery::resolve)
     }
 
     /// Build the redactor from this context's config, seeded with the process
@@ -115,6 +183,7 @@ pub fn scan(ctx: &ScanContext) -> ScanReport {
     let mcp_servers = scan_mcp(&endpoint.id, &ctx.home, &ctx.project, &ctx.mcp, &redactor);
     let processes = scan_processes(&redactor);
     let tools = scan_tools(&ctx.tools);
+    let sessions = scan_sessions(ctx);
     let findings = derive_findings(&endpoint, &agents, &mcp_servers, &redactor);
 
     ScanReport {
@@ -123,9 +192,41 @@ pub fn scan(ctx: &ScanContext) -> ScanReport {
         mcp_servers,
         processes,
         tools,
+        sessions,
         findings,
         trace_id: TraceId::new().to_hex(),
     }
+}
+
+/// Discover native conversation stores read-only via `logbook-import`, projecting
+/// each into a slim [`SessionStoreSummary`].
+///
+/// This is **observe-only and non-fatal** (inventory never modifies anything):
+/// discovery reads no payload bodies, and any discovery [`logbook_import::Diag`]
+/// (a locked store, an unreadable directory) is surfaced as a `tracing` note —
+/// never an abort. A discovery that finds nothing simply yields an empty `Vec`,
+/// leaving the existing agents/MCP/processes/findings behavior untouched.
+fn scan_sessions(ctx: &ScanContext) -> Vec<SessionStoreSummary> {
+    let roots = ctx.session_roots();
+    let (discovered, diags) = logbook_import::discover_all_sessions(&roots);
+
+    for d in &diags {
+        // Non-fatal: surface, do not abort. `Diag::msg` is already free of
+        // payload bodies (per the import-crate contract).
+        match d.level {
+            logbook_import::Level::Error => {
+                tracing::warn!(origin = %d.origin.display(), "conversation-store discovery: {}", d.msg);
+            }
+            logbook_import::Level::Warn => {
+                tracing::debug!(origin = %d.origin.display(), "conversation-store discovery: {}", d.msg);
+            }
+        }
+    }
+
+    discovered
+        .iter()
+        .map(SessionStoreSummary::from_discovered)
+        .collect()
 }
 
 /// Run a scan **and persist** it to the inventory tables + emit a correlated
@@ -272,6 +373,10 @@ fn summary_event(report: &ScanReport, trace: TraceId) -> Event {
         .with_attr(
             "processes",
             i64::try_from(report.processes.len()).unwrap_or(i64::MAX),
+        )
+        .with_attr(
+            "conversation_stores",
+            i64::try_from(report.sessions.len()).unwrap_or(i64::MAX),
         )
         .with_attr(
             "findings",
@@ -464,6 +569,87 @@ mod tests {
         assert!(
             !ev_json.contains("PLANTEDSECRET"),
             "timeline leaked secret: {ev_json}"
+        );
+    }
+
+    #[test]
+    fn scan_surfaces_discovered_conversation_stores_from_fixture_dir() {
+        // Seed a recognizable Gemini store layout under a temp dir and inject it
+        // as the session-discovery root; the scan must surface it read-only in
+        // `ScanReport.sessions` with the expected tool + native id, without
+        // touching the rest of the scan.
+        let home = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let stores = tempfile::tempdir().unwrap();
+
+        // `{root}/.gemini/tmp/{hash}/chats/session-*.json` — the standard layout
+        // the Gemini source discovers (one file → one session).
+        let session_file = stores
+            .path()
+            .join(".gemini")
+            .join("tmp")
+            .join("proj-hash")
+            .join("chats")
+            .join("session-0001.json");
+        std::fs::create_dir_all(session_file.parent().unwrap()).unwrap();
+        std::fs::write(
+            &session_file,
+            serde_json::json!({
+                "sessionId": "scan-fixture-session",
+                "projectHash": "proj-hash",
+                "messages": [
+                    { "type": "user", "content": "hi" },
+                    { "type": "gemini", "content": "hello", "model": "gemini-2.0-flash" }
+                ]
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let mut ctx = ScanContext::discover(home.path(), project.path());
+        // Inject the fixture dir as the only discovery root (no real data dirs).
+        ctx.session_roots = Some(logbook_import::discovery::from_path(
+            stores.path().to_path_buf(),
+        ));
+
+        let report = scan(&ctx);
+
+        assert_eq!(
+            report.sessions.len(),
+            1,
+            "expected one discovered store, got: {:#?}",
+            report.sessions
+        );
+        let s = &report.sessions[0];
+        assert_eq!(s.tool, "gemini");
+        assert_eq!(s.native_id, "scan-fixture-session");
+        assert_eq!(s.approx_messages, Some(2));
+        // The import selector is `{origin_fingerprint}:{native_key}`.
+        assert!(
+            s.import_id.ends_with(":scan-fixture-session"),
+            "import_id should select the native key: {}",
+            s.import_id
+        );
+    }
+
+    #[test]
+    fn scan_sessions_is_empty_and_non_fatal_with_no_stores() {
+        // With a discovery root that contains no recognizable store, discovery
+        // finds nothing and the scan proceeds normally (observe-only).
+        let home = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let empty = tempfile::tempdir().unwrap();
+
+        let mut ctx = ScanContext::discover(home.path(), project.path());
+        ctx.session_roots = Some(logbook_import::discovery::from_path(
+            empty.path().to_path_buf(),
+        ));
+
+        let report = scan(&ctx);
+        assert!(
+            report.sessions.is_empty(),
+            "no stores expected: {:#?}",
+            report.sessions
         );
     }
 }

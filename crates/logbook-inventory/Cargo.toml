@@ -19,6 +19,11 @@ clap = { version = "4.6", features = ["derive"] }
 rusqlite = "0.38"
 similar = { version = "2.7.0", default-features = false, features = ["text"] }
 logbook-capture = { version = "0.1.0", path = "../logbook-capture" }
+# Read-only discovery of native conversation stores (Cursor/Gemini/Continue) for
+# the scan's "Conversation Stores" surface. Path dep (the import crate is not a
+# workspace dep); `logbook-import` depends on neither store nor inventory, so
+# `inventory → import` is acyclic.
+logbook-import = { version = "0.1.0", path = "../logbook-import" }
 tokio = { workspace = true, features = ["rt"] }
 
 [dev-dependencies]

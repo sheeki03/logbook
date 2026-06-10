@@ -844,6 +844,11 @@ mod tests {
         // mutation, so this is safe to run in parallel with sibling tests.
         let mut ctx = ScanContext::discover(home_dir(), project.path());
         ctx.agents = crate::agents::AgentScanOptions::with_path(bindir.path().to_string_lossy());
+        // Hermetic: scope conversation-store discovery to the (store-free) project
+        // tempdir so this test never walks the real machine's data dirs.
+        ctx.session_roots = Some(logbook_import::discovery::from_path(
+            project.path().to_path_buf(),
+        ));
         let mut buf = Vec::new();
         run_with_context(&args, ctx, &mut buf).unwrap();
 

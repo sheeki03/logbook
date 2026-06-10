@@ -34,6 +34,11 @@ fn plant_agent(dir: &Path, name: &str) {
 fn ctx_with_planted(bindir: &Path, home: &Path, project: &Path) -> ScanContext {
     let mut ctx = ScanContext::discover(home, project);
     ctx.agents = AgentScanOptions::with_path(bindir.to_string_lossy());
+    // Hermetic: scope conversation-store discovery to the test's (store-free)
+    // home tempdir so `scan` never walks the real machine's data dirs — which
+    // would make these tests slow, non-deterministic, and dependent on whatever
+    // Cursor/Gemini/Continue history the developer happens to have on disk.
+    ctx.session_roots = Some(logbook_import::discovery::from_path(home.to_path_buf()));
     ctx
 }
 
