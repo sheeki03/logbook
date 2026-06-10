@@ -28,6 +28,10 @@ logbook-harness = { version = "0.1.0", path = "../logbook-harness" }
 # logbook-hub powers `logbook hub serve` (the v1.5 loopback fleet receiver +
 # governance plane). Referenced by path, matching the other workspace members.
 logbook-hub = { version = "0.1.0", path = "../logbook-hub" }
+# logbook-import powers `logbook import <tool>` (retroactive Cursor/Gemini/Continue
+# session import). The CLI is the sole persister: it maps the neutral
+# ImportSessionHeader → AgentSessionRecord and writes the batch.
+logbook-import = { version = "0.1.0", path = "../logbook-import" }
 logbook-inventory = { version = "0.1.0", path = "../logbook-inventory" }
 # logbook-llmproxy powers `logbook proxy llm` (the Phase-4 Complete-tier provider
 # proxy, gated behind `--yes`). Referenced by path, matching the other members.
@@ -47,3 +51,6 @@ tracing-subscriber = { version = "0.3.20", features = ["env-filter"] }
 
 [dev-dependencies]
 tempfile = "3.27.0"
+# Seed temp Cursor `state.vscdb` stores in the `logbook import` tests. `bundled`
+# matches logbook-store so SQLite links the same way under the workspace build.
+rusqlite = { version = "0.38", features = ["bundled"] }

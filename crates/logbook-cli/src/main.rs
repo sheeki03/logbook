@@ -45,8 +45,8 @@ use logbook_inventory::cli::{AgentArgs, InventoryArgs};
 
 use commands::{codex as codex_cmd, debug as debug_cmd, detect as detect_cmd,
     export as export_cmd, forget as forget_cmd, guard as guard_cmd, hooks as hooks_cmd,
-    hub as hub_cmd, mcp as mcp_cmd, proxy as proxy_cmd, revert as revert_cmd, run as run_cmd,
-    security as security_cmd, session as session_cmd, ui as ui_cmd};
+    hub as hub_cmd, import as import_cmd, mcp as mcp_cmd, proxy as proxy_cmd, revert as revert_cmd,
+    run as run_cmd, security as security_cmd, session as session_cmd, ui as ui_cmd};
 
 /// Local-first observability plane for agent-built software.
 #[derive(Debug, Parser)]
@@ -96,6 +96,11 @@ enum Command {
     /// first-class redacted logbook events — the Codex counterpart to the Claude
     /// hooks tier (`logbook codex -- <codex exec args...>`).
     Codex(codex_cmd::CodexArgs),
+
+    /// Retroactively import a GUI/IDE agent's on-disk conversation store (Cursor
+    /// today; Gemini/Continue later) onto the timeline, redacted — appearing in
+    /// the Sessions tab and scannable by `detect` (`logbook import <tool>`).
+    Import(import_cmd::ImportArgs),
 
     /// Endpoint Inventory Lite: scan / watch / report.
     Inventory(InventoryArgs),
@@ -169,6 +174,7 @@ fn dispatch(command: Command) -> anyhow::Result<i32> {
         Command::Ui(args) => ui_cmd::run(args),
         Command::Agent(args) => commands::inventory::agent(&args),
         Command::Codex(args) => codex_cmd::run(args),
+        Command::Import(args) => import_cmd::run(args),
         Command::Inventory(args) => commands::inventory::inventory(&args),
         Command::Debug(args) => debug_cmd::run(args),
         Command::Security(args) => security_cmd::run(args),
