@@ -32,6 +32,7 @@ pub mod config;
 pub mod correlation;
 pub mod error;
 pub mod event;
+pub mod hash;
 pub mod ids;
 pub mod redact;
 pub mod session;
@@ -51,6 +52,7 @@ pub use event::{
     AgentBlock, Blocks, Category, ConsoleBlock, Event, FindingBlock, Kind, LlmBlock,
     MicrosTimestamp, NetworkBlock, Severity, Status, ToolBlock,
 };
+pub use hash::fnv1a_128;
 pub use ids::{SpanId, TraceId};
 pub use redact::{Redactor, SecretKind};
 pub use session::{EventId, RunId, SessionId};
