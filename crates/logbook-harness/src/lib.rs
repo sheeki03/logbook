@@ -56,7 +56,7 @@
 use serde_json::Value;
 
 use logbook_core::{
-    CapturePolicy, Event, Redactor, SensitivityClass, SpanId, TraceId,
+    fnv1a_128, CapturePolicy, Event, EventId, Redactor, SensitivityClass, SpanId, TraceId,
 };
 
 mod context;
@@ -65,12 +65,18 @@ pub mod aider;
 pub mod claude;
 pub mod codex;
 pub mod codex_json;
+pub mod continue_;
+pub mod cursor;
+pub mod gemini;
 
 pub use aider::AiderAdapter;
 pub use claude::ClaudeCodeAdapter;
 pub use codex::CodexAdapter;
 pub use codex_json::{parse_codex_json_stream, CodexJsonAdapter};
 pub use context::HarnessContext;
+pub use continue_::ContinueAdapter;
+pub use cursor::CursorAdapter;
+pub use gemini::GeminiAdapter;
 
 /// An adapter that normalizes one harness's native records into logbook
 /// [`Event`]s.
@@ -133,6 +139,57 @@ pub fn turn_span_id(trace: TraceId, turn: u64) -> SpanId {
         out[7] = 0x01;
     }
     SpanId::from_bytes(out)
+}
+
+/// Derive the **deterministic** [`EventId`] for an imported record on `trace`.
+///
+/// Live capture lets [`Event::new`] mint a random id, but the *import* path must
+/// be reproducible: re-importing an unchanged source store has to reproduce
+/// byte-identical event rows (id included), so an event's id is derived from its
+/// content coordinates instead of OS entropy. [`EventId::generate`] is therefore
+/// **banned** on this path.
+///
+/// The id is `hex(fnv1a_128(trace.as_bytes() ‖ coord ‖ 0x00 ‖ role))`:
+/// - `trace` already folds in the source's `origin_fingerprint` (see the import
+///   crate's `import_trace_id`), so event ids inherit cross-store namespacing
+///   even when `coord` (e.g. an inline bubble index) repeats across stores;
+/// - `coord` is the record's intrinsic stable key (a bubble id, message index,
+///   …) — the thing that is stable across re-imports of the same store;
+/// - `role` disambiguates the 1-record → N-events fan-out (e.g. a single
+///   assistant turn that yields both an `Agent` message and an `Llm` step), and
+///   a `0x00` separator keeps `(coord, role)` unambiguous so `("ab", "c")` and
+///   `("a", "bc")` can never collide.
+///
+/// The 16-byte digest is rendered as 32 lowercase hex characters. The id is
+/// **nonzero-guarded** (an all-zero digest has its last byte set to `1`) so it
+/// can never be the empty/degenerate id; in practice FNV-1a never produces an
+/// all-zero digest for these inputs, but the guard makes the invariant explicit.
+#[must_use]
+pub fn import_event_id(trace: TraceId, coord: &str, role: &str) -> EventId {
+    let mut buf = Vec::with_capacity(TraceId::LEN + coord.len() + 1 + role.len());
+    buf.extend_from_slice(trace.as_bytes());
+    buf.extend_from_slice(coord.as_bytes());
+    buf.push(0u8);
+    buf.extend_from_slice(role.as_bytes());
+
+    let mut digest = fnv1a_128(&buf);
+    // Guard the degenerate all-zero id (parallels `turn_span_id`'s guard).
+    if digest == [0u8; 16] {
+        digest[15] = 0x01;
+    }
+    EventId::new(hex_lower(&digest))
+}
+
+/// Lowercase-hex encode a byte slice (small, allocation-light helper for the
+/// deterministic id derivations). Mirrors the encoder in `logbook_core::ids`.
+fn hex_lower(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for &b in bytes {
+        out.push(HEX[(b >> 4) as usize] as char);
+        out.push(HEX[(b & 0x0f) as usize] as char);
+    }
+    out
 }
 
 /// Shared constructor surface for the adapters: a [`Redactor`] plus the
@@ -209,6 +266,53 @@ mod tests {
         let span = turn_span_id(trace, 5);
         assert!(!span.is_zero(), "guard must avoid the invalid all-zero span id");
         assert_eq!(span.to_hex(), "0000000000000001");
+    }
+
+    #[test]
+    fn import_event_id_is_deterministic_and_32_hex() {
+        let trace = TraceId::from_bytes([
+            0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e,
+            0x0f, 0x10,
+        ]);
+        let a = import_event_id(trace, "bubble:7", "user");
+        let b = import_event_id(trace, "bubble:7", "user");
+        assert_eq!(a, b, "same (trace,coord,role) must yield the same event id");
+        // 16 bytes → 32 lowercase hex chars.
+        assert_eq!(a.as_str().len(), 32);
+        assert!(
+            a.as_str()
+                .chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
+            "event id hex must be lowercase: {}",
+            a.as_str()
+        );
+    }
+
+    #[test]
+    fn import_event_id_varies_by_coord_and_role() {
+        let trace = TraceId::from_bytes([0xab; 16]);
+        let base = import_event_id(trace, "msg:1", "user");
+        // Different coord differs.
+        assert_ne!(base, import_event_id(trace, "msg:2", "user"));
+        // Different role differs (the 1-record → N-events fan-out).
+        assert_ne!(base, import_event_id(trace, "msg:1", "assistant"));
+        // The 0x00 separator keeps (coord,role) unambiguous: ("ab","c") vs
+        // ("a","bc") must not collide.
+        assert_ne!(
+            import_event_id(trace, "ab", "c"),
+            import_event_id(trace, "a", "bc")
+        );
+        // Different trace differs even with identical (coord,role).
+        let other = TraceId::from_bytes([0xcd; 16]);
+        assert_ne!(base, import_event_id(other, "msg:1", "user"));
+    }
+
+    #[test]
+    fn import_event_id_is_nonzero() {
+        // No input should yield the degenerate all-zero (64-zero-char) id.
+        let trace = TraceId::from_bytes([0x00; 16]);
+        let id = import_event_id(trace, "", "");
+        assert_ne!(id.as_str(), "0".repeat(32));
     }
 
     #[test]
