@@ -9,6 +9,7 @@ members = [
     "crates/logbook-debug",
     "crates/logbook-inventory",
     "crates/logbook-harness",
+    "crates/logbook-import",
     "crates/logbook-detect",
     "crates/logbook-security",
     "crates/logbook-ui",

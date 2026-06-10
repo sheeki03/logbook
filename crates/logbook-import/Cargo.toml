@@ -1,0 +1,26 @@
+[package]
+name = "logbook-import"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Retroactive session importers: read GUI/IDE agent conversation stores (Cursor, Gemini, Continue) read-only and hand neutral record batches to the harness adapters. Reads sources; does not persist."
+
+[dependencies]
+logbook-core = { workspace = true }
+# Path dep (not a workspace dep): the harness is not in the root
+# [workspace.dependencies], and this crate needs its `import_event_id` + adapters.
+logbook-harness = { path = "../logbook-harness" }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+# Read source SQLite stores (e.g. Cursor's state.vscdb) read-only. Matches the
+# 0.38 already used by logbook-inventory / logbook-store.
+rusqlite = "0.38"
+# Per-OS data/config/home roots for discovery.
+dirs = "6"
+
+[dev-dependencies]
+tempfile = "3.27.0"
