@@ -21,7 +21,7 @@ $ logbook ui                    # replay the whole thing in a local web UI
 ```
 
 - **Local-first & private** — one SQLite file, loopback-only servers, no telemetry. Secrets are scrubbed *at capture, before anything is written to disk*.
-- **Agent-agnostic** — wrap any CLI; ingest Claude Code hooks; parse Codex's structured stream; or proxy raw provider traffic.
+- **Agent-agnostic** — wrap any CLI; ingest Claude Code hooks; parse Codex's structured stream; proxy raw provider traffic; or **import** an IDE assistant's on-disk history after the fact.
 - **Single static binary** — Rust core + an embedded web UI. Apache-2.0.
 
 ---
@@ -90,7 +90,24 @@ logbook codex -- "refactor the auth module and add tests"
 
 ### Anything else
 
-Any CLI gets the Universal tier: `logbook agent -- <cli>`. Any agent or SDK that talks to a provider directly and honors a base-URL override (`ANTHROPIC_BASE_URL` / `OPENAI_BASE_URL`) can be recorded by the LLM proxy. Any MCP-using agent can route its tools through `logbook proxy mcp -- <server>`. Tools that proxy LLM traffic through their own cloud backend can't be intercepted locally — for those, use the wrap or MCP tiers.
+Any CLI gets the Universal tier: `logbook agent -- <cli>`. Any agent or SDK that talks to a provider directly and honors a base-URL override (`ANTHROPIC_BASE_URL` / `OPENAI_BASE_URL`) can be recorded by the LLM proxy. Any MCP-using agent can route its tools through `logbook proxy mcp -- <server>`. Tools that proxy LLM traffic through their own cloud backend can't be intercepted locally — for those, use the wrap or MCP tiers, or **import their on-disk history after the fact** (see [Import what already happened](#import-what-already-happened)).
+
+## Import what already happened
+
+Live capture covers the agents you launch through logbook. But GUI/IDE assistants that route their traffic through a private cloud backend — Cursor and others — leave nothing to intercept locally, even though their conversations sit on disk. `logbook import` reads those on-disk stores **retroactively** and lands each past session on the same redacted timeline:
+
+```sh
+logbook import cursor --dry-run     # list discovered conversations; writes nothing
+logbook import cursor                # import them — redacted, deduplicated, replayable
+logbook import gemini                # also supported: gemini (Gemini CLI), continue (Continue)
+```
+
+- **Opt-in and explicit** — you run it, per tool; never background harvesting.
+- **Same redaction floor** — imported records flow through the identical secrets-floor pipeline before anything is written; the importer never persists a raw payload.
+- **Idempotent** — every id and timestamp is derived from the source (namespaced per store), so re-importing an unchanged store changes nothing — no duplicates.
+- **Read-only at the source** — stores are opened read-only; a locked store is skipped with a note, never modified.
+
+Imported sessions appear in the web UI and answer to `detect`, `export`, and the rest, exactly like live captures. `logbook inventory scan` surfaces what's importable without touching it. Supported today: **Cursor** (chat / composer / agent `state.vscdb`), **Gemini CLI**, and **Continue**; Windsurf, Trae, and OpenCode are planned.
 
 ## What you can do with the recording
 
@@ -100,7 +117,7 @@ Any CLI gets the Universal tier: `logbook agent -- <cli>`. Any agent or SDK that
 - **Share safely** — `logbook session export <id>` writes a self-contained, per-class **sanitized** bundle (metadata only by default; payload classes dropped) for a bug report or PR.
 - **Forget** — `logbook forget <session | --before 7d>` irreversibly deletes a session from the store *and* disk; retention caps prune automatically.
 - **Account for cost** — per-session, per-model token and cost roll-ups.
-- **Export** — emit the timeline to OpenTelemetry / OpenInference / Langfuse / MLflow.
+- **Export** — emit the timeline to OpenTelemetry / OpenInference / Langfuse / MLflow — or a **redacted chat dataset for fine-tuning** (`--format finetune`; message bodies stay out unless you pass `--include-payloads`).
 - **Roll up a fleet** — `logbook hub serve` receives redacted records from many machines, with role-based visibility, server-side retention, and a tamper-evident hash-chain audit log.
 
 ## Privacy & safety
@@ -124,6 +141,7 @@ All subcommands accept `--out-dir <path>` (default `.logbook`).
 | `logbook tail [query] [-- <tail args>]` | Replay/follow a captured run (latest, or fuzzy-matched) |
 | `logbook agent -- <agent-cli>` | Wrap an agent session: transcript + session-accurate file diffs |
 | `logbook codex -- <task>` | Run Codex under capture, recording its `--json` event stream as structured events |
+| `logbook import <cursor\|gemini\|continue>` | Retroactively import an agent's on-disk conversation history onto the timeline — redacted, idempotent, read-only at the source (`--dry-run` to preview) |
 | `logbook proxy llm --yes [--no-token]` | Opt-in local LLM API proxy — records full provider prompts/responses (Anthropic & OpenAI Chat/Responses) |
 | `logbook proxy mcp -- <server>` | Relay an agent's MCP through logbook, recording redacted tool calls |
 | `logbook hooks` | Receiver for Claude Code hooks / OTLP; prints a ready-to-paste settings recipe |
@@ -132,9 +150,9 @@ All subcommands accept `--out-dir <path>` (default `.logbook`).
 | `logbook revert <session>` | Reverse a clean-tree session's file changes (post-state-hash guarded) |
 | `logbook session export <id>` | Write a per-class sanitized session bundle |
 | `logbook forget <session \| --before <dur>>` | Irreversibly delete a session from store + disk (`--yes`) |
-| `logbook inventory <scan\|watch\|report>` | Discover local agent CLIs, MCP servers, sessions, and risk/shadow items |
+| `logbook inventory <scan\|watch\|report>` | Discover local agent CLIs, MCP servers, importable conversation stores, and risk/shadow items |
 | `logbook security <scan\|import>` | Run scanners (Semgrep/Trivy/cargo-audit) or import any SARIF/JSON |
-| `logbook export --format <otel\|openinference\|langfuse\|mlflow>` | Export the timeline to a tracing schema |
+| `logbook export --format <otel\|openinference\|langfuse\|mlflow\|finetune>` | Export the timeline to a tracing schema, or a redacted fine-tuning chat dataset (`finetune`; bodies opt-in via `--include-payloads`) |
 | `logbook ui` | Embedded web UI — timeline, session replay, inventory, risk feed |
 | `logbook mcp` | Read-only MCP tool surface over stdio for your agent |
 | `logbook hub serve` | Fleet receiver: RBAC, retention, hash-chain audit, multi-endpoint roll-up |
@@ -178,7 +196,8 @@ A single binary over a Cargo workspace; the event model is defined once and shar
 | `logbook-store` | SQLite store (rusqlite + refinery), FTS, retention/prune, hash-chain audit |
 | `logbook-capture` | PTY capture, process-tree supervision, ANSI cleaning, transcript tiers |
 | `logbook-inventory` | Agent/MCP discovery, the `agent` wrapper, session-accurate diffs, revert/export/forget |
-| `logbook-harness` | Harness adapters — Claude Code hooks, Codex `--json`, Aider |
+| `logbook-harness` | Harness adapters — Claude Code hooks, Codex `--json`, Aider; Cursor / Gemini / Continue session adapters |
+| `logbook-import` | Retroactive importers — discover & read on-disk agent stores into redacted events (CLI owns persistence; no store/inventory dep) |
 | `logbook-collector` | Loopback ingest (`/v1/hooks`, `/v1/traces`, browser `/ingest`) + MCP proxy |
 | `logbook-llmproxy` | Opt-in LLM API proxy (Anthropic + OpenAI Chat/Responses), SSE reassembly, force-redaction |
 | `logbook-detect` | Anomaly/risk rule engine → `Finding` events |
@@ -195,7 +214,7 @@ A single binary over a Cargo workspace; the event model is defined once and shar
 
 - **macOS / Linux.** (Windows is not supported.)
 - Reversing a session uses git as the preimage, so it applies to **clean-tree** sessions; reverting changes made on top of a dirty working tree is planned (it requires encrypted preimage storage).
-- GUI / IDE assistants that route LLM traffic through their own cloud backend can't be captured by the local proxy — use the wrap or MCP tiers for those.
+- GUI / IDE assistants that route LLM traffic through their own cloud backend can't be captured *live* by the local proxy — use the wrap or MCP tiers, or **`logbook import`** to pull their on-disk history retroactively (Cursor / Gemini / Continue today; Windsurf / Trae / OpenCode planned).
 
 ## License
 
