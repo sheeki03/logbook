@@ -16,6 +16,13 @@
 //! Langfuse / Phoenix / MLflow: **no** prompt management, evals, datasets,
 //! annotations, replay, or cost dashboards.
 //!
+//! Alongside the span path, [`finetune`] provides a **conversation-shaped**
+//! fine-tuning export ([`events_to_finetune_jsonl`]): it groups the timeline by
+//! trace and folds each into a chat JSONL record. It deliberately does *not* go
+//! through [`SpanExportAdapter`] (a fine-tune dataset is not a span set), and it
+//! is **payload-gated** — bodies are emitted only on explicit opt-in because
+//! "redacted" is not the same as "safe to train on" (see [`FinetuneOptions`]).
+//!
 //! # Example
 //! ```
 //! use logbook_core::{Event, Kind, Category, TraceId, LlmBlock};
@@ -34,6 +41,7 @@
 
 pub mod adapter;
 pub mod error;
+pub mod finetune;
 pub mod langfuse;
 pub mod mlflow;
 pub mod openinference;
@@ -42,6 +50,7 @@ pub mod otel_adapter;
 
 pub use adapter::SpanExportAdapter;
 pub use error::{ExportError, Result};
+pub use finetune::{events_to_finetune_jsonl, FinetuneOptions};
 pub use langfuse::LangfuseAdapter;
 pub use mlflow::MlflowAdapter;
 pub use openinference::OpenInferenceAdapter;
